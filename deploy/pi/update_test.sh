@@ -2864,7 +2864,9 @@ serve_with() {
 }
 printf '443 http://127.0.0.1:9999\n' >"$work_dir/other-serve.conf"
 # serve_drift WHAT SERVE HAVE [NAME]: with SERVE as the Serve status, and NAME (the fake Pi's own
-# name by default) as the device's tailnet name, the run prints Serve's drift line, HAVE as its have.
+# name by default) as the device's tailnet name, the run prints Serve's drift line, HAVE as its have:
+# each handler's port, path and kind, with no value, which the journal never holds (GPT-6.1 Sol's
+# review of #208, round 3), and the command that shows the whole setting.
 serve_drift() {
   new_pi
   install_set b
@@ -2873,24 +2875,38 @@ serve_drift() {
     printf '{"Self":{"DNSName":"%s."}}\n' "$4" >"$state/self.json"
   fi
   release=b run_update
-  expect_run "drift (Serve $1)" 0 "ghost-wispr update: Serve differs from the release: want $want_serve, have $3"
+  expect_run "drift (Serve $1)" 0 \
+    "ghost-wispr update: Serve differs from the release: want $want_serve, have $3; read the whole setting with: sudo tailscale serve status"
   [[ $(grep -c tailscale "$state/sudo.log") == 1 ]] && grep -Fqx 'timeout=10s tailscale serve status --json' "$state/sudo.log" \
     || fail "drift (Serve $1): ran tailscale other than to read Serve under its 10 s bound: $(<"$state/sudo.log")"
   grep -Fqx 'kill-after=none 10s tailscale status --self --json' "$state/timeout.log" \
     || fail "drift (Serve $1): did not read the device's name with tailscale status --self --json under its 10 s bound: $(<"$state/timeout.log")"
 }
-serve_drift 'with another target' "$(serve_json_for "$work_dir/other-serve.conf")" '443 http://127.0.0.1:9999'
+readonly proxy_at_root='443 "/" proxy'
+serve_drift 'with another target' "$(serve_json_for "$work_dir/other-serve.conf")" "$proxy_at_root"
+! grep -q 9999 <<<"$out" || fail "drift (Serve with another target): the line names the Pi's proxy target: $out"
 serve_drift 'serving nothing' '{}' none
-serve_drift 'with files at /' "$(serve_with '.Web[$host + ":443"].Handlers["/"] = {Path: "/var/www"}')" '443 "/" path "/var/www"'
+serve_drift 'with files at /' "$(serve_with '.Web[$host + ":443"].Handlers["/"] = {Path: "/var/www"}')" '443 "/" path'
 serve_drift 'with files on 8443 too' \
   "$(serve_with '.TCP["8443"] = {HTTPS: true} | .Web[$host + ":8443"] = {Handlers: {"/": {Path: "/srv/www"}}}')" \
-  "$want_serve; 8443 \"/\" path \"/srv/www\""
+  "$proxy_at_root; 8443 \"/\" path"
 serve_drift 'with a proxy at another path too' \
   "$(serve_with '.Web[$host + ":443"].Handlers["/admin"] = {Proxy: "http://127.0.0.1:9000"}')" \
-  "443 \"/admin\" proxy \"http://127.0.0.1:9000\"; $want_serve"
+  "$proxy_at_root; 443 \"/admin\" proxy"
 serve_drift 'whose proxy forwards peer capabilities' \
   "$(serve_with '.Web[$host + ":443"].Handlers["/"].AcceptAppCaps = ["example.com/cap/admin"]')" \
-  "443 \"/\" proxy \"${serve_lines[0]#* }\" accept-app-caps [\"example.com/cap/admin\"]"
+  "$proxy_at_root accept-app-caps"
+# Handlers that hold text someone set, each with a canary: a Text body, a redirect and a proxy
+# target. The line names their ports, paths and kinds, and holds none of the three. The control:
+# the Serve status the run reads holds them. Break it catches: a drift line that prints Serve's
+# lines as the comparison reads them, values and all.
+# shellcheck disable=SC2016 # $host is jq's variable.
+text_serve=$(serve_with '.Web[$host + ":443"].Handlers["/"] = {Proxy: "http://127.0.0.1:9/dummy-serve-proxy-canary"}
+  | .Web[$host + ":443"].Handlers["/note"] = {Text: "dummy-serve-text-canary"}
+  | .TCP["8443"] = {HTTPS: true} | .Web[$host + ":8443"] = {Handlers: {"/": {Redirect: "https://example.test/dummy-serve-redirect-canary"}}}')
+[[ $(grep -o 'dummy-serve-[a-z]*-canary' <<<"$text_serve" | grep -c .) == 3 ]] || fail "control: the Serve status holds no three canaries: $text_serve"
+serve_drift 'whose handlers hold text' "$text_serve" "$proxy_at_root; 443 \"/note\" text; 8443 \"/\" redirect"
+! grep -q 'dummy-serve-[a-z]*-canary' <<<"$out" || fail "drift (Serve whose handlers hold text): the run printed what a handler holds: $out"
 # A device renamed after its Serve was set: tailscaled keeps the Web entry of the name it had before,
 # beside the entry of its name now (deploy/pi/testdata/serve-status-after-rename.json, the office
 # Pi's answer of 2026-11-27 with the neutral tailnet's names). Serve differs, and the line names the
@@ -2898,9 +2914,9 @@ serve_drift 'whose proxy forwards peer capabilities' \
 # Break it catches: a reader that drops the host of a Web entry, so the old name's entry reads as a
 # second line of this device's port, or as nothing.
 renamed_serve=$(jq -c . "$repo_root/deploy/pi/testdata/serve-status-after-rename.json")
-serve_drift 'after a rename' "$renamed_serve" "$want_serve; $want_serve on ghost-wispr-1.example-tailnet.ts.net"
+serve_drift 'after a rename' "$renamed_serve" "$proxy_at_root; $proxy_at_root on ghost-wispr-1.example-tailnet.ts.net"
 serve_drift 'after a rename, read on the old name' "$renamed_serve" \
-  "$want_serve; $want_serve on ghost-wispr.example-tailnet.ts.net" ghost-wispr-1.example-tailnet.ts.net
+  "$proxy_at_root; $proxy_at_root on ghost-wispr.example-tailnet.ts.net" ghost-wispr-1.example-tailnet.ts.net
 # A release whose serve.conf has two lines matches a Serve of both, and differs from a Serve of one.
 make_release two-ports "$commit_b"
 printf '9443 http://127.0.0.1:9081\n' >>"$releases/two-ports/ghost-wispr-pi-deploy/serve.conf"
@@ -2916,7 +2932,8 @@ install_set two-ports
 release=two-ports run_update
 mapfile -t two_lines < <(grep -Ev '^[[:space:]]*(#|$)' "$releases/two-ports/ghost-wispr-pi-deploy/serve.conf" | LC_ALL=C sort)
 printf -v want_two '%s; ' "${two_lines[@]}"
-expect_run 'drift (one of two Serve lines)' 0 "ghost-wispr update: Serve differs from the release: want ${want_two%; }, have $want_serve"
+expect_run 'drift (one of two Serve lines)' 0 \
+  "ghost-wispr update: Serve differs from the release: want ${want_two%; }, have $proxy_at_root; read the whole setting with: sudo tailscale serve status"
 # A Serve status it cannot read (tailscale fails, answers what is not one ServeConfig, or hangs past
 # its 10 s bound) is UNKNOWN, never a match. So is a Serve of a shape the reader does not know: a
 # handler that is no object, one of two kinds, a Web entry on a port that serves no HTTPS, an HTTPS

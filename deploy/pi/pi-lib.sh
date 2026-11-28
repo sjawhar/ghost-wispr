@@ -327,10 +327,17 @@ device_tailnet_name() {
 # no HTTPS, an HTTPS port with no handler, a TCP forward or plain HTTP, Funnel, a service or a
 # foreground Serve. So a caller can tell a Serve it cannot read from one that matches serve.conf,
 # and never reads a part it does not know as a match.
+#
+# serve_lines_from_status JSON NAME shape prints the same lines with no handler's value, for output
+# a person reads: "<port> <path> <kind>", with " accept-app-caps" when the handler forwards peer
+# capabilities, and the " on <name>" of another name when that name is a DNS name, else " on a
+# name that is no DNS name". A Text handler's body, a redirect, a proxy target, a file path and
+# the capabilities are what someone set in Serve, which provision.sh never copies into its output
+# (GPT-6.1 Sol's review of #208, round 3).
 serve_lines_from_status() {
   local pl_lines
   [[ -n $1 && -n ${2:-} ]] || return 1
-  pl_lines=$(jq -rs --arg name "$2" '
+  pl_lines=$(jq -rs --arg name "$2" --arg shape "${3:-}" '
     def check(cond; why): if cond then . else error(why) end;
     def kinds: "Path", "Proxy", "Text", "Redirect";
     check(length == 1; "not one JSON value") | .[0]
@@ -345,7 +352,9 @@ serve_lines_from_status() {
     | [$web | to_entries[]
         | check(.key | test("^[^:]+:[1-9][0-9]{0,4}$"); "a Web key that is not <host>:<port>")
         | (.key | split(":")) as [$host, $port]
-        | (if $host == $name then "" else " on \($host)" end) as $on
+        | (if $host == $name then ""
+           elif $shape == "shape" and ($host | test("^[A-Za-z0-9.-]+$") | not) then " on a name that is no DNS name"
+           else " on \($host)" end) as $on
         | check($tcp | has($port); "a Web entry on a port that serves no HTTPS")
         | check(.value | type == "object" and keys == ["Handlers"] and (.Handlers | type == "object" and length > 0);
             "a Web entry that is not a set of handlers")
@@ -358,7 +367,10 @@ serve_lines_from_status() {
             and ($handler.AcceptAppCaps | . == null or (type == "array" and all(.[]; type == "string")));
             "a handler it does not know")
         | $kind[0]
-        | if $path == "/" and .key == "Proxy" and $handler.AcceptAppCaps == null and (.value | test("^\\S+$"))
+        | if $shape == "shape"
+          then "\($port) \($path | @json) \(.key | ascii_downcase)"
+            + if $handler.AcceptAppCaps == null then "" else " accept-app-caps" end
+          elif $path == "/" and .key == "Proxy" and $handler.AcceptAppCaps == null and (.value | test("^\\S+$"))
           then "\($port) \(.value)"
           else "\($port) \($path | @json) \(.key | ascii_downcase) \(.value | @json)"
             + if $handler.AcceptAppCaps == null then "" else " accept-app-caps \($handler.AcceptAppCaps | @json)" end

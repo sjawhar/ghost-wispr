@@ -802,10 +802,13 @@ join_lines() {
 }
 
 # report_drift prints a line for each bootstrap file that is not the release's, and for a Serve
-# setting that is not the release's serve.conf for the device's tailnet name (D4, R16). It changes
-# nothing, and no exit code.
+# setting that is not the release's serve.conf for the device's tailnet name (D4, R16). Of the
+# Pi's Serve it prints each handler's port, path and kind, never its value (serve_lines_from_status's
+# shape): a Text body, a redirect or a proxy target is what someone set in Serve, and the journal
+# keeps what it is given (GPT-6.1 Sol's review of #208, round 3). It changes nothing, and no exit
+# code.
 report_drift() {
-  local names name want have serve self device
+  local names name want have shape serve self device
   if names=$(bootstrap_drift "$manifest_json" "$DEPLOY_DIR" "$UNIT_DIR"); then
     while IFS= read -r name; do
       if [[ -n $name ]]; then
@@ -834,7 +837,9 @@ report_drift() {
     return 0
   fi
   if [[ $have != "$want" ]]; then
-    printf 'ghost-wispr update: Serve differs from the release: want %s, have %s\n' "$(join_lines "$want")" "$(join_lines "$have")"
+    shape=$(serve_lines_from_status "$serve" "$device" shape) || shape=''
+    printf 'ghost-wispr update: Serve differs from the release: want %s, have %s; read the whole setting with: sudo tailscale serve status\n' \
+      "$(join_lines "$want")" "$(join_lines "$shape")"
   fi
 }
 

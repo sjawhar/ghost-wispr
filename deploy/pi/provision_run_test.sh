@@ -33,10 +33,11 @@ readonly work_dir
 trap 'rm -rf -- "$work_dir"' EXIT
 
 # The cases of this test, each of which begin names.
-readonly case_names=(bundle-refused not-a-release first-run one-update-start release-files-first
-  credentials-written bootstrap-files no-env-no-system-files groups-and-linger join-command idempotent
-  credentials-same credentials-differ client-id newer-release newer-release-certificate bootstrap-repair
-  serve provision-unit update-fails recorder-unit join route-check manager-env key certificate models)
+readonly case_names=(cleanup bundle-refused not-a-release first-run one-update-start
+  release-files-first credentials-written bootstrap-files no-env-no-system-files groups-and-linger
+  join-command idempotent credentials-same credentials-differ client-id newer-release
+  newer-release-certificate bootstrap-repair serve provision-unit update-fails recorder-unit join
+  route-check manager-env key certificate models)
 current_case=setup
 ran_cases=' '
 
@@ -85,7 +86,9 @@ readonly release_api=https://api.test.invalid/releases/latest status_url=http://
 readonly tailscale_call_timeout=5 \
   uuid_re='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 # The fake system manager's transient units: a file NAME.service for each active one
-# (start_system_unit), which the fake systemctl reads and stops.
+# (start_system_unit), which the fake systemctl reads and stops. Each fake unit, the run's, its
+# Serve apply's, notes its session, the control group a unit's stop ends, in TEST_UNIT_SESSIONS, and
+# the test's exit stops each one (stop_fake_units). Once TEST_STOPPING exists, no fake unit starts.
 readonly system_units=$work_dir/system-units
 export TEST_LOG="$work_dir/log" TEST_UID="$uid" TEST_RUNTIME_DIR="$runtime_dir" TEST_DEPLOY="$deploy" \
   TEST_UNIT_DIR="$units" TEST_BINARY="$work_dir/recorder-binary" \
@@ -93,8 +96,65 @@ export TEST_LOG="$work_dir/log" TEST_UID="$uid" TEST_RUNTIME_DIR="$runtime_dir" 
   TEST_SERVE_HOST=ghost-wispr.example-tailnet.ts.net TEST_ROUTE_ALL="$work_dir/route-all" TEST_SUBJECT="$subject" \
   TEST_REAL_DATE="$real_date" TEST_REAL_SLEEP="$real_sleep" TEST_STATE="$state" TEST_RELEASES="$work_dir/releases" \
   TEST_CLOCK="$work_dir/clock" TEST_SYSTEM_UNITS="$system_units" TEST_REAL_JQ="$real_jq" \
-  TEST_REAL_INSTALL="$real_install" TEST_REAL_OPENSSL="$real_openssl"
+  TEST_REAL_INSTALL="$real_install" TEST_REAL_OPENSSL="$real_openssl" \
+  TEST_UNIT_SESSIONS="$work_dir/unit-sessions" TEST_STOPPING="$work_dir/stopping"
 mkdir -p -- "$bin" "$join" "$first_join" "$TEST_RELEASES" "$system_units"
+
+# unit_pids SID... prints the PID of each process of the sessions SID... that is this test's, whose
+# environment holds this test's TEST_LOG, compared as text: a session ID that the system has since
+# given to another session is not this test's, and none of its processes is printed. As a pattern,
+# the "." of a temporary path would match any character (GPT-6.1 Sol's review of #208, round 3).
+unit_pids() {
+  local pid sid
+  while read -r pid sid; do
+    [[ " $* " == *" $sid "* ]] || continue
+    if grep -qzxF -- "TEST_LOG=$TEST_LOG" "/proc/$pid/environ" 2>/dev/null; then
+      printf '%s\n' "$pid"
+    fi
+  done < <(ps -eo pid=,sid=)
+}
+# stop_fake_units stops each fake unit that the test started and TEST_UNIT_SESSIONS notes, by its
+# session: SIGTERM to each of its processes that unit_pids names, then SIGKILL to any left 5 s
+# later, as a unit's stop does. Then it forgets them.
+stop_fake_units() {
+  local name sid pids sids=()
+  [[ -s $TEST_UNIT_SESSIONS ]] || return 0
+  while read -r name sid; do
+    [[ ! $sid =~ ^[0-9]+$ ]] || sids+=("$sid")
+  done <"$TEST_UNIT_SESSIONS"
+  : >"$TEST_UNIT_SESSIONS"
+  ((${#sids[@]})) || return 0
+  pids=$(unit_pids "${sids[@]}")
+  # shellcheck disable=SC2086 # One PID a word.
+  [[ -z $pids ]] || kill -TERM $pids 2>/dev/null || true
+  for _ in {1..50}; do
+    pids=$(unit_pids "${sids[@]}")
+    [[ -n $pids ]] || return 0
+    "$real_sleep" 0.1
+  done
+  # shellcheck disable=SC2086 # One PID a word.
+  kill -KILL $pids 2>/dev/null || true
+}
+# stop_test runs on each exit of the test, a failed case's among them: no fake unit starts from
+# then on, each fake unit and each background job of the test stops, by its session or its exact
+# PID, and the test's directory goes. A case that fails midway left its units running before.
+# PROVISION_RUN_TEST_KEEP_UNITS, which only the cleanup case sets, plants the old exit: the stops
+# are skipped, so that case can show its check finds what they leave.
+stop_test() {
+  local job
+  : >"$TEST_STOPPING" 2>/dev/null || true
+  if [[ -z ${PROVISION_RUN_TEST_KEEP_UNITS:-} ]]; then
+    stop_fake_units || true
+    for job in $(jobs -p); do
+      kill "$job" 2>/dev/null || true
+    done
+  fi
+  rm -rf -- "$work_dir"
+}
+trap stop_test EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 # hang WHAT: what each fake does in place of a command that never ends. It writes its PID to
 # $TEST_LOG.hung-WHAT, and then waits 600 s.
@@ -223,6 +283,14 @@ case $1 in
   journalctl)
     if [[ " $* " == *' -u ghost-wispr-serve-'* ]]; then
       cat -- "$TEST_LOG.serve-journal" 2>/dev/null
+    elif [[ " $* " =~ \ -u\ (ghost-wispr-provision(-join)?)(\.service)?\  ]]; then
+      # A run's unit: the lines in $TEST_LOG.unit-journal-UNIT, the last N of them with -n N.
+      journal=$TEST_LOG.unit-journal-${BASH_REMATCH[1]}
+      if [[ " $* " =~ \ -n\ ([0-9]+)\  ]]; then
+        tail -n "${BASH_REMATCH[1]}" -- "$journal" 2>/dev/null
+      else
+        cat -- "$journal" 2>/dev/null
+      fi
     elif [[ -f ${TEST_JOURNAL:-} ]]; then
       cat -- "$TEST_JOURNAL"
     fi
@@ -252,6 +320,8 @@ case $1 in
           "$TEST_REAL_SLEEP" 0.1
         done
       fi
+      # A start held past the test's exit starts nothing.
+      [[ ! -e $TEST_STOPPING && -d $TEST_SYSTEM_UNITS ]] || exit 1
       exec system-unit "$unit" "$directory" "${setenv[@]}" -- "${program[@]}"
     fi
     if [[ " $* " == *' --wait '* ]]; then
@@ -266,6 +336,11 @@ case $1 in
       fi
       # shellcheck disable=SC2016 # The unit's shell expands its own arguments.
       exec setsid -w bash -c '
+        # The unit notes its session, its PID under setsid, for the test'"'"'s exit to stop; it does
+        # not start once the test stops.
+        if ! printf "serve %s\n" "$$" >>"$TEST_UNIT_SESSIONS" 2>/dev/null || [[ -e $TEST_STOPPING ]]; then
+          exit 1
+        fi
         limit=$1
         shift
         status=0
@@ -353,6 +428,7 @@ while [[ $1 != -- ]]; do
   shift
 done
 shift
+[[ ! -e $TEST_STOPPING && -d $TEST_SYSTEM_UNITS ]] || exit 1
 unit_file=$TEST_SYSTEM_UNITS/$name.service
 main=$(sed -n 's/^MainPID=//p' "$unit_file" 2>/dev/null) || main=
 # A unit of the name that is active, or failed and kept, as systemd keeps a failed unit that has no
@@ -399,6 +475,11 @@ done
 rm -f -- "$main_file"
 printf 'ActiveState=active\nActiveEnterTimestamp=%s\nMainPID=%s\n' \
   "$("$TEST_REAL_DATE" -u '+%a %Y-%m-%d %H:%M:%S UTC')" "$main" >"$unit_file"
+# The unit's session, for the test's exit to stop. A unit that starts while the test stops, whose
+# session that stop may not have read, ends at once.
+if ! printf '%s %s\n' "$name" "$main" >>"$TEST_UNIT_SESSIONS" 2>/dev/null || [[ -e $TEST_STOPPING ]]; then
+  "${0%/*}/session-signal" KILL "$main" || true
+fi
 status=0
 wait "$waiter" || status=$?
 "${0%/*}/session-signal" TERM "$main"
@@ -659,9 +740,14 @@ EOF
 #   Sol's review of #203 did; `serve status --json` prints the setting, or fails with
 #   TEST_SERVE_STATUS_EXIT;
 # - `debug prefs` prints RouteAll.
+# With TEST_TAILSCALE_STDERR set, each call first prints that text on stderr. With
+# TEST_SERVE_NEEDS_LOGIN=1, `serve --bg` finds the node logged out: it prints the login URL
+# TEST_SERVE_LOGIN_URL as Tailscale v1.104.1 does (cmd/tailscale/cli/serve_legacy.go:206-216, with
+# isRunningOrStarting of status.go:262-285: "Logged out." and "Log in at: URL", on stderr) and exits 1.
 cat >"$bin/tailscale" <<'EOF'
 #!/usr/bin/env bash
 printf 'tailscale %s\n' "$*" >>"$TEST_LOG"
+[[ -z ${TEST_TAILSCALE_STDERR:-} ]] || printf '%s\n' "$TEST_TAILSCALE_STDERR" >&2
 unexpected() {
   printf 'fake tailscale: unexpected call: tailscale %s\n' "$*" >&2
   exit 2
@@ -747,6 +833,10 @@ case $1 in
         ;;
       '--bg --https '*)
         (($# == 5)) || unexpected "$@"
+        if [[ ${TEST_SERVE_NEEDS_LOGIN:-} == 1 ]]; then
+          printf 'Logged out.\nLog in at: %s\n' "$TEST_SERVE_LOGIN_URL" >&2
+          exit 1
+        fi
         code=${TEST_SERVE_EXIT:-0}
         if ((${TEST_SERVE_HANG_TIMES:-0} > 0)); then
           hung=$(cat -- "$TEST_LOG.serve-hung" 2>/dev/null) || hung=0
@@ -936,8 +1026,9 @@ make_stage() {
 
 # new_pi makes the fake Pi as provision.sh --key and --certificate leave it: the key and the first
 # certificate, and no other file of Ghost Wispr. Serve serves nothing, the node has not joined yet,
-# no recorder runs, and each log starts empty.
+# no recorder runs, no fake unit of a case before runs, and each log starts empty.
 new_pi() {
+  stop_fake_units
   rm -rf -- "$pi"
   mkdir -p -- "$deploy" "$units" "$key_dir" "$sysroot" "$state"
   printf 'the key\n' >"$key"
@@ -1022,11 +1113,12 @@ EOF
 # real_provision NAME runs the provision.sh of release NAME, now the latest release, on the fake Pi,
 # joined to the tailnet, with the real nightly update behind the update unit's start: the real
 # launcher and update.sh run against the fake release API, recorder, systemd, sudo and Tailscale,
-# on a clock that sleep moves. The update's lines go to the journal that provision.sh prints.
+# on a clock that sleep moves. The update's lines go to the journal $work_dir/journal, and the Serve
+# unit's to $TEST_LOG.serve-journal, which provision.sh names but never prints.
 real_provision() {
   cp -- "$TEST_RELEASES/$1/release.json" "$TEST_RELEASES/latest.json"
   : >"$TEST_LOG"
-  rm -f -- "$TEST_LOG.errors"
+  rm -f -- "$TEST_LOG.errors" "$TEST_LOG.serve-journal"
   : >"$work_dir/journal"
   printf '1000\n' >"$TEST_CLOCK"
   TEST_REAL_UPDATE=1 TEST_JOURNAL=$work_dir/journal TEST_SELF_STATUS=$joined_status \
@@ -1053,6 +1145,7 @@ installed_set() {
 # expect_ran WHAT fails unless the run exited 0, printed no bash error, and broke no rule of a fake.
 expect_ran() {
   ((rc == 0)) || fail "$1: provision.sh exited $rc: $(<"$work_dir/out")"
+  read_no_journal "$1"
   if grep -E 'provision\.sh: line [0-9]+: ' "$work_dir/out" >&2; then
     fail "$1: provision.sh printed a bash error (above)"
   fi
@@ -1063,9 +1156,31 @@ expect_ran() {
 expect_refused() {
   ((rc != 0)) || fail "$1: provision.sh exited 0: $(<"$work_dir/out")"
   grep -Fq -- "$2" "$work_dir/out" || fail "$1: provision.sh did not say '$2': $(<"$work_dir/out")"
+  read_no_journal "$1"
+}
+
+# read_no_journal WHAT fails when the run read the journal of a unit, the Serve apply's, the nightly
+# update's or a run's, or printed a line of the Serve unit: a unit's lines can hold a login URL of
+# tailscale (GPT-6.1 Sol's review of #208, rounds 1 and 2), so a run names the command that reads
+# them and never copies them into its own output.
+read_no_journal() {
+  ! grep -Eq '^sudo journalctl .*(-u ghost-wispr-|_SYSTEMD_USER_UNIT=)' "$TEST_LOG" \
+    || fail "$1: provision.sh read a unit's journal: $(grep -E '^sudo journalctl ' "$TEST_LOG")"
+  ! grep -Fq 'ghost-wispr serve: ' "$work_dir/out" || fail "$1: provision.sh printed its Serve unit's lines: $(<"$work_dir/out")"
 }
 
 said() { grep -Fq -- "$1" "$work_dir/out"; }
+# serve_journaled TEXT: the Serve unit's journal holds TEXT. update_journaled TEXT: the nightly
+# update's journal does.
+serve_journaled() { grep -Fq -- "$1" "$TEST_LOG.serve-journal" 2>/dev/null; }
+update_journaled() { grep -Fq -- "$1" "$work_dir/journal" 2>/dev/null; }
+# expect_busy WHAT WHY: the run refused a busy recorder in its own words and named the Serve unit's
+# journal, whose line, not the run's output, says WHY.
+expect_busy() {
+  expect_refused "$1" 'so Serve was not reset and nothing in Serve was changed'
+  said 'its journal says why: sudo journalctl -u ghost-wispr-serve-' || fail "$1: provision.sh did not name the Serve unit's journal: $(<"$work_dir/out")"
+  serve_journaled "ghost-wispr serve: $2; Serve was not reset" || fail "$1: the Serve unit did not say '$2': $(cat -- "$TEST_LOG.serve-journal" 2>/dev/null)"
+}
 logged() { grep -Fxq -- "$1" "${2:-$TEST_LOG}"; }
 
 # line_of LINE [LOG] prints the number of the first line of LOG that is LINE, or nothing.
@@ -1091,6 +1206,101 @@ serve_now() {
 
 make_stage "$stage"
 readonly joined_status='{"Self":{"Tags":["tag:ghost-wispr"],"DNSName":"ghost-wispr.example-tailnet.ts.net."}}'
+
+# ---------------------------------------------------------------------------------------------------
+# cleanup: a case that fails midway leaves no fake unit of the test running, nor any other process
+# the test started. A planted fault of #208 once failed provision-unit and left its hung run's unit,
+# a provision.sh waiting in sleep 600, running. Run again with PROVISION_RUN_TEST_PLANTED_FAILURE=1
+# and a TMPDIR of its own, this test fails here while three things run that outlive the removal of
+# its directory: a run's unit that hangs in its manager read, as that unit did; a Serve unit whose
+# program sleeps 600 s; and a fake join's main process, a job of the test. Every process the test
+# starts has that TMPDIR in its environment, so the check reads each process's environment, not a
+# name the process may lack. The control: with PROVISION_RUN_TEST_KEEP_UNITS=1 the exit skips its
+# stops, as the test's exit did before, and 3 s after it the check must find the run unit's
+# provision.sh, the Serve unit's program and the job; it then ends what it found by exact PID.
+# Break it catches: an exit that stops no unit or job, the control's.
+begin cleanup
+if [[ -n ${PROVISION_RUN_TEST_PLANTED_FAILURE:-} ]]; then
+  new_pi
+  (TEST_MANAGER_ENV_HANG=1 RUN_OUT=$work_dir/planted-out run_provision "$stage") &
+  (PATH="$bin:$PATH" sudo systemd-run --wait --quiet --collect --unit=ghost-wispr-serve-planted \
+    --property=RuntimeMaxSec=600 "$real_sleep" 600) &
+  "$real_sleep" 600 &
+  for _ in {1..300}; do
+    [[ ! -s $TEST_LOG.hung-show-environment || $(grep -c . "$TEST_UNIT_SESSIONS" 2>/dev/null) != 2 ]] || break
+    sleep 0.1
+  done
+  [[ -s $TEST_LOG.hung-show-environment ]] || fail "control: the planted run never hung: $(cat -- "$work_dir/planted-out" 2>/dev/null)"
+  [[ $(grep -c . "$TEST_UNIT_SESSIONS") == 2 ]] \
+    || fail "control: the planted run's unit and the Serve unit are not both noted: $(cat -- "$TEST_UNIT_SESSIONS")"
+  fail 'the planted failure'
+fi
+# left_by DIR prints the PID of each process whose environment names DIR as its TMPDIR or a path
+# under it.
+left_by() {
+  grep -lzF -e "$1/" -e "TMPDIR=$1" /proc/[0-9]*/environ 2>/dev/null | sed -n 's|^/proc/\([0-9]*\)/environ$|\1|p' || true
+}
+# planted_run DIR [NAME=VALUE...] runs this test with the planted failure, TMPDIR DIR and the
+# settings NAME=VALUE, in an environment of its own, fails unless it failed with the planted
+# failure, and 3 s after its exit sets left to what left_by DIR prints.
+planted_run() {
+  local dir=$1 status=0
+  shift
+  mkdir -p -- "$dir"
+  env -i HOME="$HOME" PATH="$PATH" "$@" PROVISION_RUN_TEST_PLANTED_FAILURE=1 TMPDIR="$dir" \
+    bash "$script_dir/provision_run_test.sh" >"$dir.out" 2>&1 || status=$?
+  if ((status != 1)) || ! grep -Fqx 'provision run test FAILED (cleanup): the planted failure' "$dir.out"; then
+    fail "control: the planted run did not fail with the planted failure (exit $status): $(<"$dir.out")"
+  fi
+  sleep 3
+  left=$(left_by "$dir")
+}
+planted_run "$work_dir/kept" PROVISION_RUN_TEST_KEEP_UNITS=1
+kept_args=$(ps -o args= -p "$(paste -sd, <<<"${left:-0}")" 2>/dev/null || true)
+grep -Eq '^/bin/bash .*/stage/provision\.sh$' <<<"$kept_args" \
+  || fail "control: the check did not find the provision.sh of the planted run's unit: $kept_args"
+grep -Fqx "timeout --kill-after=1s 600s $real_sleep 600" <<<"$kept_args" \
+  || fail "control: the check did not find the planted Serve unit's program: $kept_args"
+(($(grep -Fcx "$real_sleep 600" <<<"$kept_args") >= 3)) \
+  || fail "control: the check did not find the sleeps of the run's hang, the Serve unit and the job: $kept_args"
+# shellcheck disable=SC2086 # One PID a word.
+kill -TERM $left 2>/dev/null || true
+for _ in {1..50}; do
+  left=$(left_by "$work_dir/kept")
+  [[ -n $left ]] || break
+  sleep 0.1
+done
+# shellcheck disable=SC2086 # One PID a word.
+[[ -z $left ]] || kill -KILL $left 2>/dev/null || true
+sleep 0.5
+[[ -z $(left_by "$work_dir/kept") ]] || fail "control: processes of the planted run are left after their stop: $(left_by "$work_dir/kept")"
+planted_run "$work_dir/stopped"
+[[ -z $left ]] || fail "a case that failed midway left processes of the test 3 s after its exit: $(ps -o pid=,args= -p "$(paste -sd, <<<"$left")")"
+# A session ID that the system gave to another session (GPT-6.1 Sol's review of #208, round 3): a
+# process in a noted session whose TEST_LOG differs from this test's only where a "." is, as a
+# pattern would match it, is not this test's, and stop_fake_units leaves it. The control: a process
+# of this test in a noted session stops. Break it catches: a TEST_LOG compared as a pattern.
+near_log=${TEST_LOG//./X}
+[[ $near_log != "$TEST_LOG" ]] || fail "control: this test's TEST_LOG has no . to change: $TEST_LOG"
+setsid env TEST_LOG="$near_log" "$real_sleep" 600 &
+foreign=$!
+setsid "$real_sleep" 600 &
+owned=$!
+for _ in {1..50}; do
+  [[ $(ps -o sid= -p "$foreign" | tr -d ' ') != "$foreign" || $(ps -o sid= -p "$owned" | tr -d ' ') != "$owned" ]] || break
+  sleep 0.1
+done
+[[ $(ps -o sid= -p "$foreign" | tr -d ' ') == "$foreign" && $(ps -o sid= -p "$owned" | tr -d ' ') == "$owned" ]] \
+  || fail "control: the foreign and the owned sleep do not each lead a session"
+grep -qzxF -- "TEST_LOG=$near_log" "/proc/$foreign/environ" || fail "control: the foreign sleep does not hold the near TEST_LOG"
+printf 'foreign %s\nowned %s\n' "$foreign" "$owned" >>"$TEST_UNIT_SESSIONS"
+stop_fake_units
+foreign_state=$(ps -o stat= -p "$foreign" 2>/dev/null || true) owned_state=$(ps -o stat= -p "$owned" 2>/dev/null || true)
+kill "$foreign" "$owned" 2>/dev/null || true
+wait "$foreign" "$owned" 2>/dev/null || true
+[[ -z $owned_state || $owned_state == Z* ]] || fail "control: stop_fake_units left this test's process in a noted session (state $owned_state)"
+[[ -n $foreign_state && $foreign_state != Z* ]] \
+  || fail "stop_fake_units stopped a process whose TEST_LOG, $near_log, is not this test's, $TEST_LOG"
 
 # ---------------------------------------------------------------------------------------------------
 # bundle-refused: provision.sh reads no bundle. Input on standard input, such as the credential
@@ -1222,10 +1432,11 @@ want_start=$(
 
 begin first-run
 expect_ran 'the first run'
-said "ghost-wispr update: installed commit $release_commit (invocation test-invocation)" \
-  || fail "provision.sh did not print the update's lines from its journal: $(<"$work_dir/out")"
-grep -Eq '^sudo journalctl _SYSTEMD_USER_UNIT=ghost-wispr-update\.service --since=@[0-9]+ --no-pager --output=cat$' \
-  "$work_dir/first.log" || fail "provision.sh did not read this run's lines of the update from the journal: $(<"$work_dir/first.log")"
+# The update's lines stay in its journal (GPT-6.1 Sol's review of #208, round 2): the run says how
+# the update ended and names the command that reads this run's lines, and prints none of them.
+! said "ghost-wispr update: installed commit" || fail "provision.sh printed the update's lines from its journal: $(<"$work_dir/out")"
+grep -Eq "^ghost-wispr provision: ghost-wispr-update\.service, the nightly update, succeeded \(exit 0\); read this run's lines with: sudo journalctl _SYSTEMD_USER_UNIT=ghost-wispr-update\.service --since=@[0-9]+$" \
+  "$work_dir/out" || fail "provision.sh did not name the command that reads this run's lines of the update: $(<"$work_dir/out")"
 
 # credentials-written: where the Pi has no credential files, provision.sh writes them from pi.env
 # with each field that gcloud's create-cred-config writes for an X.509 credential, naming the Pi's
@@ -1454,13 +1665,13 @@ make_release c "$commit_c" "$commit_c"
 new_pi
 real_provision a
 expect_ran 'release a on a new Pi'
-said "ghost-wispr update: installed commit $commit_a" || fail "the update did not install release a: $(<"$work_dir/out")"
+update_journaled "ghost-wispr update: installed commit $commit_a" || fail "the update did not install release a: $(<"$work_dir/journal")"
 [[ $(head -n 1 "$deploy/deploy.verified") == "commit $commit_a" ]] || fail "deploy.verified does not name release a: $(<"$deploy/deploy.verified")"
 release_a=$(installed_set)
 [[ $release_a != *missing* && $release_a == *"answers $commit_a" ]] || fail "release a is not installed whole: $release_a"
 real_provision a
 expect_ran 'release a again'
-said "ghost-wispr update: already current at commit $commit_a" || fail "the update did not find release a current: $(<"$work_dir/out")"
+update_journaled "ghost-wispr update: already current at commit $commit_a" || fail "the update did not find release a current: $(<"$work_dir/journal")"
 [[ -z $(find "$deploy" -maxdepth 1 -name '*.prev') ]] \
   || fail "a run of the release the Pi runs made .prev copies: $(find "$deploy" -maxdepth 1 -name '*.prev')"
 [[ $(installed_set) == "$release_a" ]] || fail 'a run of the release the Pi runs changed its set'
@@ -1471,8 +1682,8 @@ said "kept the set of commit $commit_a, which the Pi runs, as its .prev copies" 
   || fail "provision.sh did not keep release a's set before it replaced update.sh: $(<"$work_dir/out")"
 # The update finds the installed set not the verified one, since provision.sh installed release b's
 # update.sh, pi-lib.sh and pi.env, so it rolls back every file that has a .prev copy.
-if ! said "did not answer /api/version with commit $commit_b" || ! said 'restored the last verified set, the one deploy.verified lists'; then
-  fail "the update did not install release b and roll it back: $(<"$work_dir/out")"
+if ! update_journaled "did not answer /api/version with commit $commit_b" || ! update_journaled 'restored the last verified set, the one deploy.verified lists'; then
+  fail "the update did not install release b and roll it back: $(<"$work_dir/journal")"
 fi
 [[ $(installed_set) == "$release_a" ]] \
   || fail "after the failed install of release b, the Pi is not on release a's set: $(diff <(printf '%s\n' "$release_a") <(installed_set) || true)"
@@ -1527,10 +1738,10 @@ for history in 'with a version file' 'with no version file'; do
   real_provision d
   expect_refused "release d with certificate version 8, $history" 'the nightly update failed'
   [[ ! -s $TEST_LOG.errors ]] || fail "release d, $history: $(<"$TEST_LOG.errors")"
-  said 'pi-secrets: certificate version 8, not after 2027-12-01T00:00:00Z: newer and signs in' \
-    || fail "control, $history: pi-secrets staged no certificate: $(<"$work_dir/out")"
-  if ! said "did not answer /api/version with commit $commit_d" || ! said 'restored the last verified set, the one deploy.verified lists'; then
-    fail "the update did not install release d and roll it back, $history: $(<"$work_dir/out")"
+  update_journaled 'pi-secrets: certificate version 8, not after 2027-12-01T00:00:00Z: newer and signs in' \
+    || fail "control, $history: pi-secrets staged no certificate: $(<"$work_dir/journal")"
+  if ! update_journaled "did not answer /api/version with commit $commit_d" || ! update_journaled 'restored the last verified set, the one deploy.verified lists'; then
+    fail "the update did not install release d and roll it back, $history: $(<"$work_dir/journal")"
   fi
   [[ $(installed_set) == "$release_a" ]] || fail "after the failed install of release d, $history, the Pi is not on release a's set"
   [[ $(certificate_file device.crt) == 'certificate version 7' ]] \
@@ -1566,7 +1777,7 @@ real_provision c
 expect_ran 'release c on a Pi whose update unit is broken'
 cmp -s -- "$TEST_RELEASES/c/ghost-wispr-pi-deploy/ghost-wispr-update.service" "$units/ghost-wispr-update.service" \
   || fail "provision.sh did not install release c's update unit: $(<"$units/ghost-wispr-update.service")"
-said "ghost-wispr update: installed commit $commit_c" || fail "the update did not install release c: $(<"$work_dir/out")"
+update_journaled "ghost-wispr update: installed commit $commit_c" || fail "the update did not install release c: $(<"$work_dir/journal")"
 [[ $(head -n 1 "$deploy/deploy.verified") == "commit $commit_c" ]] || fail "deploy.verified does not name release c: $(<"$deploy/deploy.verified")"
 said 'already joined' || fail "provision.sh stopped before the join: $(<"$work_dir/out")"
 
@@ -1610,8 +1821,10 @@ reset_line=$(grep -n '^tailscale serve reset$' "$TEST_LOG" | head -n1 | cut -d: 
 apply_line=$(grep -n '^tailscale serve --bg --https 443 ' "$TEST_LOG" | head -n1 | cut -d: -f1)
 [[ -n $status_read && -n $reset_line && -n $apply_line ]] && ((status_read < reset_line && reset_line < apply_line)) \
   || fail "the Serve apply did not read the recorder's status, then reset Serve, then apply serve.conf: $(<"$TEST_LOG")"
-said 'ghost-wispr serve: resetting Serve (tailscale serve reset) and applying serve.conf' \
-  || fail "provision.sh did not print the lines of its Serve unit: $(<"$work_dir/out")"
+serve_journaled 'ghost-wispr serve: resetting Serve (tailscale serve reset) and applying serve.conf' \
+  || fail "the Serve unit did not say that it resets Serve and applies serve.conf: $(cat -- "$TEST_LOG.serve-journal" 2>/dev/null)"
+grep -Eq "^ghost-wispr provision: ghost-wispr-serve-$uuid_re\.service, the Serve apply, succeeded \(exit 0\); read its lines, which can hold a tailscale login URL, with: sudo journalctl -u ghost-wispr-serve-$uuid_re\.service$" \
+  "$work_dir/out" || fail "provision.sh did not say how its Serve unit ended and name its journal: $(<"$work_dir/out")"
 # The run's apply has a unit and a serve-apply of its own, both named by the run's id, never by the
 # time (GPT-6.1 Sol's review of #203, round 2: two runs in one second shared a unit name), and a
 # RuntimeMaxSec: the status read (20 s), the reset and 4 tries of serve.conf's one line, each call
@@ -1828,15 +2041,118 @@ grep -Fq "another provisioning run is going on: ghost-wispr-provision.service is
 kill "$other_main"
 wait "$other_main" 2>/dev/null || true
 rm -f -- "$system_units/ghost-wispr-provision.service"
-# A failed unit that systemd keeps takes the run's name (Sol's round 6): the run resets it, says so,
-# and goes on. Break it catches: a run that leaves a kept failed unit, whose start then fails.
+# A failed unit that systemd keeps takes its name (Sol's round 6): the run prints why it failed,
+# its ActiveState, Result and ExecMainStatus, and the command that shows its journal, but never the
+# journal's lines (Sol's review of #208): a join's journal holds tailscale up's lines, its login URL
+# among them, and a run's output can be captured or shared. Then it resets the unit, says so, and
+# goes on. Breaks they catch: a run that leaves a kept failed unit, whose start then fails; one that
+# resets it with no word of why it failed; and one that prints the journal's lines.
 new_pi
-printf 'ActiveState=failed\nActiveEnterTimestamp=Thu 2026-11-27 14:02:00 UTC\nMainPID=0\n' >"$system_units/ghost-wispr-provision.service"
+printf 'ActiveState=failed\nActiveEnterTimestamp=Thu 2026-11-27 14:02:00 UTC\nMainPID=0\nResult=exit-code\nExecMainStatus=42\n' \
+  >"$system_units/ghost-wispr-provision.service"
+printf 'ActiveState=failed\nActiveEnterTimestamp=Thu 2026-11-27 14:03:00 UTC\nMainPID=0\nResult=timeout\nExecMainStatus=0\n' \
+  >"$system_units/ghost-wispr-provision-join.service"
+for kept in ghost-wispr-provision ghost-wispr-provision-join; do
+  {
+    printf 'To authenticate, visit:\n'
+    printf '\thttps://login.tailscale.com/a/dummy-login-canary-%s\n' "$kept"
+    printf 'auth key: dummy-auth-canary-%s\n' "$kept"
+  } >"$TEST_LOG.unit-journal-$kept"
+  # The control: the command that the run names shows the planted lines.
+  planted=$(PATH="$bin:$PATH" sudo journalctl -u "$kept.service" -n 20 2>/dev/null)
+  [[ $planted == *"dummy-login-canary-$kept"* && $planted == *"dummy-auth-canary-$kept"* ]] \
+    || fail "control: sudo journalctl -u $kept.service -n 20 does not show the planted journal: $planted"
+done
+grep -Eq '^sudo journalctl -u ghost-wispr-provision-join' "$TEST_LOG" || fail "control: a journal read is not logged: $(<"$TEST_LOG")"
+# The log starts empty again, so a journal read in it is the run's.
+: >"$TEST_LOG"
 run_provision "$stage" --key
-said 'ghost-wispr provision: reset the failed unit ghost-wispr-provision.service, which a run that failed left' \
-  || fail "a run did not reset and name a kept failed unit: $(<"$work_dir/out")"
+for entry in 'ghost-wispr-provision exit-code 42' 'ghost-wispr-provision-join timeout 0'; do
+  read -r kept kept_result kept_status <<<"$entry"
+  said "ghost-wispr provision: reset the failed unit $kept.service, which a run that failed left" \
+    || fail "a run did not reset and name the kept failed unit $kept: $(<"$work_dir/out")"
+  status_line="ghost-wispr provision: $kept.service failed: ActiveState=failed, Result=$kept_result, ExecMainStatus=$kept_status; its journal, which a reset leaves, shows why: sudo journalctl -u $kept.service -n 20"
+  said "$status_line" || fail "a run did not print the state and journal command of the kept failed unit $kept: $(<"$work_dir/out")"
+  status_at=$(grep -n -F -x -- "$status_line" "$work_dir/out" | head -n1 | cut -d: -f1)
+  reset_at=$(grep -n -F "reset the failed unit $kept.service" "$work_dir/out" | head -n1 | cut -d: -f1)
+  ((status_at < reset_at)) || fail "a run printed the state of the failed unit $kept after its reset: $(<"$work_dir/out")"
+done
+! grep -q canary "$work_dir/out" || fail "a run printed a failed unit's journal, a login URL among it: $(<"$work_dir/out")"
+! grep -q 'journalctl -u ghost-wispr-provision' "$TEST_LOG" || fail "a run read a failed unit's journal: $(<"$TEST_LOG")"
 said 'nothing was changed. A new key needs a new certificate request' \
   || fail "a run after a kept failed unit did not reach provision.sh --key's own check: $(<"$work_dir/out")"
+rm -f -- "$TEST_LOG".unit-journal-*
+# The caller killed by its exact PID while its run's unit runs (Sol's review of #203, round 7): it
+# removes its start marker, and ends 143. The run's unit runs on, as a lost SSH session leaves it.
+# Break it catches: a caller with no trap, whose marker stays in its TMPDIR.
+new_pi
+caller_tmp=$work_dir/caller-tmp
+rm -rf -- "$caller_tmp"
+mkdir -p -- "$caller_tmp"
+rm -f -- "$TEST_LOG.hung-show-environment" "$work_dir/caller-rc"
+export TEST_MANAGER_ENV_HANG=1
+(
+  TMPDIR=$caller_tmp RUN_OUT=$work_dir/caller-out run_provision "$stage"
+  printf '%s\n' "$rc" >"$work_dir/caller-rc"
+) &
+caller_job=$!
+unset TEST_MANAGER_ENV_HANG
+for _ in {1..300}; do
+  [[ ! -s $TEST_LOG.hung-show-environment ]] || break
+  sleep 0.1
+done
+[[ -s $TEST_LOG.hung-show-environment ]] || fail "control: the caller's run never reached its manager read: $(cat -- "$work_dir/caller-out" 2>/dev/null)"
+# The marker is the file the unit names: the fakes' own temporary files share the caller's TMPDIR.
+marker=$(tail -n 1 "$TEST_LOG.provision-units" | sed -n 's/.* --setenv=GHOST_WISPR_PROVISION_STARTED=\([^ ]*\) .*/\1/p')
+[[ $marker == "$caller_tmp"/* && -s $marker ]] || fail "control: the caller has no start marker its run marked in $caller_tmp: ${marker:-none}"
+caller_pid=$(ps -eo pid=,ppid=,args= | awk -v p="$caller_job" '$2 == p && /provision\.sh/ { print $1 }')
+[[ $caller_pid =~ ^[0-9]+$ ]] || fail "control: no caller process of the run: ${caller_pid:-none}"
+kill -TERM "$caller_pid"
+wait "$caller_job" || true
+[[ $(cat -- "$work_dir/caller-rc" 2>/dev/null) == 143 ]] || fail "the killed caller ended $(cat -- "$work_dir/caller-rc" 2>/dev/null), want 143"
+# The unit is stopped first, so a case that fails leaves no run behind; the stopped run makes no
+# marker in place of the one the caller removed.
+"$bin/systemctl" stop ghost-wispr-provision ghost-wispr-provision-join
+[[ ! -e $marker ]] || fail "the killed caller left its start marker, or its stopped run made it again: $marker"
+# The caller killed before its unit enters provision.sh (GPT-6.1 Sol's review of #208): the unit
+# reaches its own work and makes no file in place of the empty marker the caller removed. Break it
+# catches: a marker write that creates the file, which the killed-after-start case above cannot see.
+new_pi
+mkdir -p -- "$caller_tmp"
+: >"$work_dir/start-hold"
+rm -f -- "$work_dir/early-caller-rc" "$TEST_LOG.hung-show-environment" "$TEST_LOG.start-held"
+(
+  TEST_PROVISION_START_HOLD=$work_dir/start-hold TEST_MANAGER_ENV_HANG=1 \
+    TMPDIR=$caller_tmp RUN_OUT=$work_dir/early-caller-out run_provision "$stage"
+  printf '%s\n' "$rc" >"$work_dir/early-caller-rc"
+) &
+caller_job=$!
+for _ in {1..300}; do
+  [[ ! -f $TEST_LOG.start-held ]] || break
+  sleep 0.1
+done
+[[ -f $TEST_LOG.start-held ]] || fail "control: the early caller never reached the held unit start"
+marker=$(tail -n 1 "$TEST_LOG.provision-units" | sed -n 's/.* --setenv=GHOST_WISPR_PROVISION_STARTED=\([^ ]*\) .*/\1/p')
+[[ $marker == "$caller_tmp"/* && -f $marker && ! -s $marker ]] \
+  || fail "control: the early caller has no empty start marker: ${marker:-none}"
+caller_pid=$(ps -eo pid=,ppid=,args= | awk -v p="$caller_job" '$2 == p && /provision\.sh/ { print $1 }')
+[[ $caller_pid =~ ^[0-9]+$ ]] || fail "control: no early caller process: ${caller_pid:-none}"
+kill -TERM "$caller_pid"
+wait "$caller_job" || true
+[[ $(cat -- "$work_dir/early-caller-rc" 2>/dev/null) == 143 ]] || fail "the early killed caller did not exit 143"
+[[ ! -e $marker ]] || fail "the early killed caller left its empty marker: $marker"
+rm -f -- "$work_dir/start-hold"
+for _ in {1..300}; do
+  [[ ! -s $TEST_LOG.hung-show-environment ]] || break
+  sleep 0.1
+done
+reached_work=false
+[[ ! -s $TEST_LOG.hung-show-environment ]] || reached_work=true
+recreated=false
+[[ ! -e $marker ]] || recreated=true
+"$bin/systemctl" stop ghost-wispr-provision ghost-wispr-provision-join
+[[ $reached_work == true ]] || fail "control: the orphaned unit never reached its manager read"
+[[ $recreated == false && ! -e $marker ]] || fail "the unit recreated the marker removed before its start: $marker"
 # Credentials in the caller's environment stay out of the unit's settings, which any local user can
 # read (systemctl show -p Environment; Sol's round 6): only PATH and the provisioning settings go.
 # Break it catches: a run that forwards every GHOST_WISPR_ variable.
@@ -1901,9 +2217,9 @@ for busy in 'active session|{"active_session_id":"meeting-123","paused":false,"c
   cp -- "$renamed" "$TEST_SERVE_STATE"
   printf '%s\n' "${busy#*|}" >"$state/status.json"
   real_provision a
-  expect_refused "a recorder that holds $reason" "ghost-wispr serve: $reason; Serve was not reset"
-  said "ghost-wispr update: $reason; leaving the current release in place" \
-    || fail "control: the update did not find the recorder holding $reason: $(<"$work_dir/out")"
+  expect_busy "a recorder that holds $reason" "$reason"
+  update_journaled "ghost-wispr update: $reason; leaving the current release in place" \
+    || fail "control: the update did not find the recorder holding $reason: $(<"$work_dir/journal")"
   said 'nothing in Serve was changed' || fail "a recorder that holds $reason: provision.sh did not say Serve is unchanged: $(<"$work_dir/out")"
   cmp -s -- "$renamed" "$TEST_SERVE_STATE" || fail "provision.sh changed Serve while the recorder held $reason: $(<"$TEST_SERVE_STATE")"
   no_serve_change "a recorder that holds $reason"
@@ -1916,11 +2232,41 @@ real_provision a
 expect_ran 'release a on a new Pi, before the recorder becomes busy after the update'
 cp -- "$renamed" "$TEST_SERVE_STATE"
 TEST_BUSY_AFTER_UPDATE='{"active_session_id":"meeting-456","paused":false,"capture_state":"recording"}' real_provision a
-expect_refused 'a recorder that became busy after the update' 'ghost-wispr serve: active session; Serve was not reset'
-said "ghost-wispr update: already current at commit $commit_a" \
-  || fail "control: the update did not find the recorder free: $(<"$work_dir/out")"
+expect_busy 'a recorder that became busy after the update' 'active session'
+update_journaled "ghost-wispr update: already current at commit $commit_a" \
+  || fail "control: the update did not find the recorder free: $(<"$work_dir/journal")"
 cmp -s -- "$renamed" "$TEST_SERVE_STATE" || fail "provision.sh changed Serve while the recorder became busy: $(<"$TEST_SERVE_STATE")"
 no_serve_change 'a recorder that became busy after the update'
+# A Serve whose handlers hold text someone set (GPT-6.1 Sol's review of #208, round 3): a Text
+# body, a redirect and a proxy target, each with a canary. The run names each port, path and kind
+# of handler and the command that shows the whole setting, and prints none of the three, on the
+# busy recorder's refusal (exit 75, Sol's reproduction) as on the reset and apply. The control:
+# Tailscale's answer, which the run reads, holds them. Break it catches: a run that prints Serve's
+# lines as serve_lines_from_status reads them, values and all.
+text_serve='{"TCP":{"443":{"HTTPS":true},"8443":{"HTTPS":true}},"Web":{"ghost-wispr.example-tailnet.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:9/dummy-serve-proxy-canary"},"/note":{"Text":"dummy-serve-text-canary"}}},"ghost-wispr.example-tailnet.ts.net:8443":{"Handlers":{"/":{"Redirect":"https://example.test/dummy-serve-redirect-canary"}}}}}'
+for recorder in busy free; do
+  new_pi
+  printf '%s\n' "$text_serve" >"$TEST_SERVE_STATE"
+  answer=$(PATH="$bin:$PATH" tailscale serve status --json)
+  [[ $(grep -o 'dummy-serve-[a-z]*-canary' <<<"$answer" | LC_ALL=C sort | paste -sd ' ') == 'dummy-serve-proxy-canary dummy-serve-redirect-canary dummy-serve-text-canary' ]] \
+    || fail "control: Tailscale's answer does not hold the three canaries: $answer"
+  : >"$TEST_LOG"
+  if [[ $recorder == busy ]]; then
+    : >"$state/active"
+    printf '%s\n' '{"active_session_id":"meeting-789","paused":false,"capture_state":"recording"}' >"$state/status.json"
+    run_provision "$stage"
+    expect_busy 'a busy recorder and Serve handlers that hold text' 'active session'
+  else
+    TEST_SELF_STATUS=$joined_status run_provision "$stage"
+    expect_ran 'Serve handlers that hold text'
+    serve_is 'Serve handlers that hold text' "$want_serve"
+  fi
+  ! grep -q 'dummy-serve-[a-z]*-canary' "$work_dir/out" \
+    || fail "a run printed what a Serve handler holds ($recorder recorder): $(<"$work_dir/out")"
+  for words in '443 "/" proxy;443 "/note" text;8443 "/" redirect' 'read the whole setting with: sudo tailscale serve status'; do
+    said "$words" || fail "the run ($recorder recorder) did not say '$words': $(<"$work_dir/out")"
+  done
+done
 # A running recorder whose status cannot be read: an answer that is not its status, and a read that
 # does not end in time. Its state is unknown, so the apply refuses. Break it catches: an apply that
 # takes no status for a free recorder.
@@ -1934,7 +2280,7 @@ for unreadable in 'an answer that is not a status' 'a read that does not end in 
   else
     TEST_STATUS_CURL_EXIT=28 run_provision "$stage"
   fi
-  expect_refused "a running recorder with $unreadable" 'ghost-wispr serve: ghost-wispr.service is active, and /api/status gave no status; Serve was not reset'
+  expect_busy "a running recorder with $unreadable" 'ghost-wispr.service is active, and /api/status gave no status'
   cmp -s -- "$renamed" "$TEST_SERVE_STATE" || fail "provision.sh changed Serve with $unreadable: $(<"$TEST_SERVE_STATE")"
   no_serve_change "a running recorder with $unreadable"
   [[ ! -e $TEST_LOG.join ]] || fail "provision.sh started the join with $unreadable"
@@ -1960,7 +2306,7 @@ for manager in 'a manager that does not answer|TEST_SERVICE_STATE_HANG=1|the sta
   for setting in $settings; do
     unset "${setting%%=*}"
   done
-  expect_refused "$what" "ghost-wispr serve: $reason, and /api/status gave no status; Serve was not reset"
+  expect_busy "$what" "$reason, and /api/status gave no status"
   cmp -s -- "$renamed" "$TEST_SERVE_STATE" || fail "$what: provision.sh changed Serve: $(<"$TEST_SERVE_STATE")"
   no_serve_change "$what"
 done
@@ -1985,8 +2331,8 @@ cp -- "$renamed" "$TEST_SERVE_STATE"
 TEST_SERVE_FAIL_TIMES=1 run_provision "$stage"
 expect_ran 'a Serve call that fails once after the reset'
 serve_is 'a Serve call that fails once after the reset' "$want_serve"
-said 'ghost-wispr serve: a tailscale serve call failed or did not end within 5 s after the reset; applying serve.conf again (try 2 of 4)' \
-  || fail "the apply did not say it applied serve.conf again: $(<"$work_dir/out")"
+serve_journaled 'ghost-wispr serve: a tailscale serve call failed or did not end within 5 s after the reset; applying serve.conf again (try 2 of 4)' \
+  || fail "the apply did not say it applied serve.conf again: $(cat -- "$TEST_LOG.serve-journal" 2>/dev/null)"
 # A tailscale serve call that never ends after a reset that did (Sol's review of #203, round 2: the
 # first apply hung, the try did not end, and provision.sh waited for good): each call ends after
 # 5 s, here, and its failure takes a try. Break it catches: a call with no bound, which the unit's
@@ -1996,8 +2342,24 @@ cp -- "$renamed" "$TEST_SERVE_STATE"
 TEST_SERVE_HANG_TIMES=1 run_provision "$stage"
 expect_ran 'a Serve call that never ends after the reset'
 serve_is 'a Serve call that never ends after the reset' "$want_serve"
-said 'did not end within 5 s after the reset; applying serve.conf again (try 2 of 4)' \
-  || fail "the apply did not say a call did not end and that it applied serve.conf again: $(<"$work_dir/out")"
+serve_journaled 'did not end within 5 s after the reset; applying serve.conf again (try 2 of 4)' \
+  || fail "the apply did not say a call did not end and that it applied serve.conf again: $(cat -- "$TEST_LOG.serve-journal" 2>/dev/null)"
+# A node that Tailscale logs out during the apply (GPT-6.1 Sol's review of #208, round 2, with
+# Tailscale 1.104.4): each tailscale serve --bg after the reset prints "Logged out." and the login
+# URL, and fails. The run says that the apply failed, its exit and the command that reads its
+# journal, and prints no line of that journal. Break it catches: a run that copies its Serve unit's
+# lines into its own output, as the run did four times with the URL in Sol's reproduction.
+new_pi
+login_url=https://login.tailscale.com/a/dummy-serve-login-canary
+TEST_SERVE_NEEDS_LOGIN=1 TEST_SERVE_LOGIN_URL=$login_url run_provision "$stage"
+[[ $(grep -c -F "Log in at: $login_url" "$TEST_LOG.serve-journal" 2>/dev/null) == 4 ]] \
+  || fail "control: the Serve unit's journal does not hold the login URL of 4 tries: $(cat -- "$TEST_LOG.serve-journal" 2>/dev/null)"
+! grep -Eq 'dummy-serve-login-canary|Log in at|Logged out' "$work_dir/out" \
+  || fail "a run printed the login URL of a node logged out during the Serve apply: $(<"$work_dir/out")"
+expect_refused 'a node logged out during the Serve apply' "Serve is now [none], so the page is not served: run the release's ./provision.sh again"
+grep -Eq "^ghost-wispr provision: ghost-wispr-serve-$uuid_re\.service, the Serve apply, failed \(exit 1\); read its lines, which can hold a tailscale login URL, with: sudo journalctl -u ghost-wispr-serve-$uuid_re\.service$" \
+  "$work_dir/out" || fail "provision.sh did not say that its Serve unit failed and name its journal: $(<"$work_dir/out")"
+[[ ! -e $TEST_LOG.join ]] || fail "provision.sh started the join although the node is logged out"
 # A call that fails on every try: the apply ends failed after 4 tries, and provision.sh says that the
 # page is not served and what to run, and stops before the join.
 new_pi
@@ -2006,18 +2368,31 @@ expect_refused 'a Serve line that tailscale refuses on every try' "Serve is now 
 [[ $(grep -c '^tailscale serve --bg --https 443 ' "$TEST_LOG") == 4 ]] \
   || fail "the apply tried serve.conf's line $(grep -c '^tailscale serve --bg --https 443 ' "$TEST_LOG") times, want 4"
 [[ ! -e $TEST_LOG.join ]] || fail "provision.sh started the join although Serve is not serve.conf's"
+# No tailscale call's output reaches a run's output (Sol's review of #208, round 2): each call prints
+# a canary on stderr, the run's own reads of the node's status and of Serve, and its Serve unit's
+# reset and apply. Break it catches: a run that passes a tailscale call's stderr through.
+new_pi
+cp -- "$renamed" "$TEST_SERVE_STATE"
+TEST_SELF_STATUS=$joined_status TEST_TAILSCALE_STDERR=tailscale-stderr-canary run_provision "$stage"
+expect_ran 'tailscale calls that print on stderr'
+for call in 'tailscale status --self --json' 'tailscale serve status --json' 'tailscale serve reset'; do
+  logged "$call" || fail "control: the run made no call '$call': $(<"$TEST_LOG")"
+done
+serve_journaled tailscale-stderr-canary || fail "control: the Serve unit's journal does not hold the canary: $(cat -- "$TEST_LOG.serve-journal" 2>/dev/null)"
+! said tailscale-stderr-canary || fail "a run printed a tailscale call's stderr: $(<"$work_dir/out")"
 
 # ---------------------------------------------------------------------------------------------------
-# update-fails: when the update fails, provision.sh prints that run's lines from the journal and
-# fails, before it enables the recorder, touches Serve or joins.
+# update-fails: when the update fails, provision.sh says so and names the command that reads that
+# run's lines from the journal, prints none of them, and fails, before it enables the recorder,
+# touches Serve or joins.
 begin update-fails
 new_pi
 printf '%s\n' 'ghost-wispr launcher: invocation test-invocation trigger none at none' \
   'ghost-wispr update: could not read the latest release from https://api.github.com/repos/sjawhar/ghost-wispr/releases/latest' \
   >"$work_dir/journal"
 TEST_UPDATE_EXIT=1 TEST_JOURNAL=$work_dir/journal run_provision "$stage"
-expect_refused 'a failed update' 'could not read the latest release'
-said 'ghost-wispr-update.service' || fail "provision.sh did not name the update that failed: $(<"$work_dir/out")"
+expect_refused 'a failed update' "the nightly update failed (systemctl --user start ghost-wispr-update.service exited 1); read this run's lines with: sudo journalctl _SYSTEMD_USER_UNIT=ghost-wispr-update.service --since=@"
+! said 'could not read the latest release' || fail "provision.sh printed the failed update's lines from its journal: $(<"$work_dir/out")"
 if grep -Eq 'enable ghost-wispr\.service|tailscale serve|systemd-run' "$TEST_LOG"; then
   fail "provision.sh went on after the update failed: $(<"$TEST_LOG")"
 fi

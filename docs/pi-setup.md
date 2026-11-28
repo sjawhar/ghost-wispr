@@ -270,9 +270,20 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
    a time: while that unit or the join a run starts, `ghost-wispr-provision-join`, is active, a
    second run fails at once, names the unit, when it became active and its main PID, and changes
    nothing. The run checks the join again in its own unit, before it changes a file, as a join can
-   become active in between; and a run whose start loses to another's gives the same refusal. A
-   unit of either name that systemd keeps failed would take the name, so a run first resets it
-   with `systemctl reset-failed` and says so. To end a run, and its join, run
+   become active in between; and a run whose start loses to another's gives the same refusal. That
+   check is a snapshot: a `ghost-wispr-provision-join` that someone starts by hand with systemd,
+   outside `provision.sh`, after it runs beside the run, so start the join only through
+   `provision.sh`. A unit of either name that systemd keeps failed would take the name, so a run
+   first prints why it failed, its `ActiveState`, `Result` and `ExecMainStatus`, and the command
+   that shows its journal, `sudo journalctl -u <unit>.service -n 20`, but not the journal's lines:
+   the join's hold the lines of `tailscale up`, its login URL among them. Then it resets the unit
+   with `systemctl reset-failed`, which leaves its journal, and says so. A run copies no unit's
+   lines into its own output: they can hold a login URL of Tailscale, such as the one
+   `tailscale serve` prints when the device is logged out. It says how a unit ended and names the
+   command that reads its lines. Of what tailscale answers it prints only the device's tailnet
+   name and, of Serve's setting, the ports, paths and kinds of handler, never a handler's text,
+   redirect, proxy target or file path: `sudo tailscale serve status` shows the whole setting. To
+   end a run, and its join, run
    `sudo systemctl stop ghost-wispr-provision ghost-wispr-provision-join`, which ends every
    process in the run's unit, its control group, and makes the run fail (exit 143); a root process
    that moves itself to another unit leaves that boundary. An SSH session that ends does not
@@ -293,17 +304,22 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
      `pi-lib.sh` and `pi.env`. It turns on lingering for `ghost-wispr` and enables the timer;
    - starts the nightly update once, with `systemctl --user start ghost-wispr-update.service`. That
      run installs the release's whole deploy set and reads the Pi's secrets ("Update and inspect").
-     `provision.sh` prints the run's journal lines, and stops when the run failed;
+     `provision.sh` says whether the run succeeded, with its exit, and names the command that
+     reads that run's lines,
+     `sudo journalctl _SYSTEMD_USER_UNIT=ghost-wispr-update.service --since=@<start>`, and stops
+     when the run failed;
    - enables `ghost-wispr.service`;
    - makes Tailscale Serve exactly the release's `serve.conf` for the device's tailnet name now, as
      `tailscale status --self --json` gives it. A Serve that is that already stays as it is. Any
      other it gives to `serve-apply`, which runs as root in a systemd unit of its own, apart from
-     `provision.sh`, which waits for it and prints its lines. The unit and its `serve-apply` are the
-     run's own, named by its run id, and `serve-apply` removes itself when it ends, so no run
-     removes another run's. `serve-apply` reads the recorder's `/api/status` immediately before the
-     reset. While the recorder records a conversation (a non-empty `active_session_id`) or holds a
-     call whose `state` is not `none`, it resets nothing, and `provision.sh` stops and says that
-     nothing in Serve was changed: run it again after the meeting. With no status that it can
+     `provision.sh`, which waits for it, then says whether it succeeded, with its exit, and names
+     the command that reads its lines, `sudo journalctl -u ghost-wispr-serve-<run id>.service`. The
+     unit and its `serve-apply` are the run's own, named by its run id, and `serve-apply` removes
+     itself when it ends, so no run removes another run's. `serve-apply` reads the recorder's
+     `/api/status` immediately before the reset. While the recorder records a conversation (a
+     non-empty `active_session_id`) or holds a call whose `state` is not `none`, it resets nothing,
+     and `provision.sh` stops and says that nothing in Serve was changed, and the unit's journal
+     says why: run it again after the meeting. With no status that it can
      read, it goes on only when `ghost-wispr`'s user manager confirms `inactive` for
      `ghost-wispr.service` within 30 s; a manager that does not answer, a read that fails, or any
      other state refuses the same way. The read is a snapshot: a session that starts after that
@@ -320,7 +336,8 @@ restarts the recorder, and a restart ends a conversation that is being recorded.
      `serve.conf` does not hold. From the reset until the last line is applied, the page and
      `/call` are not served. A kill of `provision.sh` or a lost SSH session does not stop the unit,
      so the apply still ends. When the unit fails or does not end in time, `provision.sh` prints
-     `Serve is now [<lines>]`, or `[none]` when the page is not served, and the command to run.
+     `Serve is now [<port> "<path>" <kind>;...]`, or `[none]` when the page is not served, and the
+     command to run.
      When every try failed, or the Pi lost power during the apply, Serve stays empty, and only
      another run of `./provision.sh` puts it back: the nightly update never changes Serve, and
      check 7 of `check-deploy.sh` fails with `have none` and names that command. Then
@@ -1056,10 +1073,12 @@ A run of `update.sh`:
    `ghost-wispr-update.timer`) with the manifest, and the live Tailscale Serve setting with the
    release's `serve.conf`, for the device's tailnet name as `tailscale status --self --json` gives
    it. A Serve entry of another name, such as the one tailscaled keeps under the device's name
-   before a rename, is a line `<port> <proxy target> on <name>`. It prints one drift line for each
-   difference:
+   before a rename, compares as a line `<port> <proxy target> on <name>`. It prints one drift line
+   for each difference. Of the Pi's Serve the line names each handler as `<port> "<path>" <kind>`,
+   never its text, redirect or proxy target, which `sudo tailscale serve status` shows; check 7 of
+   `check-deploy.sh` names it the same way:
    - `ghost-wispr update: provisioning file <name> differs from the release; run the release's provision.sh`
-   - `ghost-wispr update: Serve differs from the release: want <lines>, have <lines>`
+   - `ghost-wispr update: Serve differs from the release: want <lines>, have <port> "<path>" <kind>; read the whole setting with: sudo tailscale serve status`
    - `ghost-wispr update: Serve: UNKNOWN (<why>)`, when it cannot read or parse Serve's setting, or
      read the device's name
 

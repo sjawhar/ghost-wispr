@@ -102,11 +102,19 @@ refuse_busy() {
 
 # reset_failed_units resets each unit of a run that systemd keeps failed, which would take the
 # unit's name from the next start (Sol's review of #203, round 6), and says so. A run with --collect
-# leaves none; a unit kept by hand, or by an older provision.sh, can.
+# leaves none; a unit kept by hand, or by an older provision.sh, can. Before the reset, which leaves
+# the unit's state to no one, it prints why the unit failed: its ActiveState, Result and
+# ExecMainStatus (Sol's review of #203, round 7), and the command that shows its journal, which the
+# reset leaves. Never the journal's lines: a join's hold tailscale up's, its login URL among them,
+# and a run's output can be captured or shared (GPT-6.1 Sol's review of #208).
 reset_failed_units() {
-  local unit
+  local unit show
   for unit in "$PI_LIB_PROVISION_UNIT" "$PI_LIB_PROVISION_JOIN_UNIT"; do
     if [[ $(systemctl show -p ActiveState --value "$unit.service" 2>/dev/null) == failed ]]; then
+      show=$(systemctl show -p ActiveState -p Result -p ExecMainStatus "$unit.service" 2>/dev/null) || show=
+      printf 'ghost-wispr provision: %s.service failed: ActiveState=%s, Result=%s, ExecMainStatus=%s; its journal, which a reset leaves, shows why: sudo journalctl -u %s.service -n 20\n' \
+        "$unit" "$(sed -n 's/^ActiveState=//p' <<<"$show")" "$(sed -n 's/^Result=//p' <<<"$show")" \
+        "$(sed -n 's/^ExecMainStatus=//p' <<<"$show")" "$unit"
       sudo systemctl reset-failed "$unit.service" || fail "could not reset the failed unit $unit.service: nothing was changed"
       printf 'ghost-wispr provision: reset the failed unit %s.service, which a run that failed left\n' "$unit"
     fi
@@ -122,14 +130,16 @@ reset_failed_units() {
 # path below), as a join can become active between this check and the start. When the start itself
 # loses to another run's, it gives the same refusal, not systemd-run's line: the run marks its start
 # in the file GHOST_WISPR_PROVISION_STARTED names, so a run that never started is told from one that
-# failed. The run's end, by systemctl stop, a kill of its main process or its own end, ends every
+# failed. The marker goes when this caller ends, also by a signal, which ends it 130, 143 or 129
+# (Sol's review of #203, round 7): the run's unit, which does not depend on this caller, goes on. The
+# run's end, by systemctl stop, a kill of its main process or its own end, ends every
 # process in its unit's control group: each command of the run that stays in it (GPT-6.1 Sol's
 # review of #203, round 5, where a lock descriptor stayed with each command that inherited it). A
 # root process that moves itself to another unit leaves that boundary. An SSH session that ends
 # does not end the run: over Tailscale SSH, the session's processes and the unit stay. Before it
 # starts the unit, a run with no argument refuses data on its standard input.
 start_provision_unit() {
-  local started status=0
+  local status=0 unit_pid
   check_usage "$@"
   if (($# == 0)); then
     refuse_input
@@ -139,17 +149,23 @@ start_provision_unit() {
   refuse_busy
   provision_unit_settings
   provision_unit_command "$PI_LIB_PROVISION_UNIT" "$SERVICE_USER"
-  started=$(mktemp) || fail 'could not make the file that marks the run'"'"'s start: nothing was changed'
+  provision_started=$(mktemp) || fail 'could not make the file that marks the run'"'"'s start: nothing was changed'
+  trap 'rm -f -- "$provision_started"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+  # The start runs in the background, its input passed through, and the caller waits for it: a wait
+  # ends at a signal, where a command in the foreground would hold the trap until it ends.
   # shellcheck disable=SC2154 # pi-lib.sh's provision_unit_command and provision_unit_settings set them.
   sudo "${pl_unit_command[@]}" "${pl_unit_settings[@]}" --setenv=GHOST_WISPR_PROVISION_IN_UNIT=1 \
-    "--setenv=GHOST_WISPR_PROVISION_STARTED=$started" "--working-directory=$PWD" \
-    /bin/bash "$script_dir/provision.sh" "$@" || status=$?
-  if ((status != 0)) && [[ ! -s $started ]]; then
-    rm -f -- "$started"
+    "--setenv=GHOST_WISPR_PROVISION_STARTED=$provision_started" "--working-directory=$PWD" \
+    /bin/bash "$script_dir/provision.sh" "$@" 0<&0 &
+  unit_pid=$!
+  wait "$unit_pid" || status=$?
+  if ((status != 0)) && [[ ! -s $provision_started ]]; then
     refuse_busy
     fail "the run's unit $PI_LIB_PROVISION_UNIT did not start (systemd-run exit $status): nothing was changed. Run provision.sh again, or end a run that holds the name with: sudo systemctl stop $PI_LIB_PROVISION_UNIT $PI_LIB_PROVISION_JOIN_UNIT. An SSH session that ends does not end a run."
   fi
-  rm -f -- "$started"
   exit "$status"
 }
 
@@ -507,9 +523,11 @@ install_serve_apply() {
 }
 
 # serve_status_json prints Tailscale Serve's setting, `tailscale serve status --json`, in at most
-# TAILSCALE_CALL_TIMEOUT s.
+# TAILSCALE_CALL_TIMEOUT s. Like each tailscale call of a run, its stderr goes nowhere: a run copies
+# no tailscale output into its own, which a person can capture or share (GPT-6.1 Sol's review of
+# #208, round 2: a logged-out node's tailscale prints its login URL).
 serve_status_json() {
-  timeout --kill-after=5s "${TAILSCALE_CALL_TIMEOUT}s" sudo tailscale serve status --json
+  timeout --kill-after=5s "${TAILSCALE_CALL_TIMEOUT}s" sudo tailscale serve status --json 2>/dev/null
 }
 
 # apply_serve makes Tailscale Serve exactly serve.conf's setting for this device's tailnet name, as
@@ -525,12 +543,17 @@ serve_status_json() {
 # (TAILSCALE_CALL_TIMEOUT s and 5 s each) and 3 pauses of 2 s. The unit's serve-apply removes
 # itself, and this run removes it too once the unit has ended, as a unit that did not start leaves
 # it. When the unit fails or does not end in time, it says what Serve is now
-# and the command to run. Last it prints the unit's lines, reads Serve again, as the nightly drift
-# check reads it (pi-lib.sh's serve_lines_from_status), and fails unless it is serve.conf's. It
-# changes nothing in Serve when it cannot read the device's name or Serve.
+# and the command to run. Of the unit it prints only how it ended, its exit, and the command that
+# reads its lines, never the lines: tailscale serve prints a login URL when the node is logged out
+# (GPT-6.1 Sol's review of #208, round 2). Of Serve's setting it prints only each port, path and
+# kind of handler (serve_lines_from_status's shape), never a handler's text, redirect, proxy target
+# or file path, which are what someone set in Serve (round 3), and names the command that shows the
+# whole setting. Then it reads Serve again, as the nightly drift check reads it, and fails unless it
+# is serve.conf's. It changes nothing in Serve when it cannot read the device's name or Serve.
 apply_serve() {
-  local self name live have state unit limit now status=0
-  if ! self=$(timeout --kill-after=5s "${TAILSCALE_CALL_TIMEOUT}s" tailscale status --self --json) \
+  local self name live have shape state unit limit now result status=0
+  local whole='read the whole setting with: sudo tailscale serve status'
+  if ! self=$(timeout --kill-after=5s "${TAILSCALE_CALL_TIMEOUT}s" tailscale status --self --json 2>/dev/null) \
     || ! name=$(device_tailnet_name "$self"); then
     fail "could not read this device's tailnet name (tailscale status --self --json), for which Serve must be serve.conf's: nothing in Serve was changed"
   fi
@@ -541,41 +564,46 @@ apply_serve() {
       printf "ghost-wispr provision: Tailscale Serve is serve.conf's already for %s\n" "$name"
       return 0
     fi
-    state=${have:-none}
+    shape=$(serve_lines_from_status "$live" "$name" shape) || shape=''
+    state="[${shape:-none}]"
   else
     state="a setting it cannot read, such as a TCP forward or Funnel"
   fi
   unit="ghost-wispr-serve-$RUN_ID"
   limit=$((10 + (TAILSCALE_CALL_TIMEOUT + 5) * (2 + 4 * ${#serve_words[@]} / 2) + 3 * 2 + 30))
-  printf "ghost-wispr provision: Tailscale Serve for %s is [%s], not serve.conf's: resetting it and applying serve.conf in %s, a unit of its own, which finishes the apply even if this run or its SSH session ends\n" \
-    "$name" "$(paste -sd ';' <<<"$state")" "$unit"
+  printf "ghost-wispr provision: Tailscale Serve for %s is %s, not serve.conf's (%s): resetting it and applying serve.conf in %s, a unit of its own, which finishes the apply even if this run or its SSH session ends\n" \
+    "$name" "$(paste -sd ';' <<<"$state")" "$whole" "$unit"
   install_serve_apply
   sudo systemd-run --wait --quiet --collect --expand-environment=no --unit="$unit" --property=RuntimeMaxSec="$limit" \
     /bin/sh "$SERVE_APPLY" "$STATUS_URL" "${serve_words[@]}" </dev/null || status=$?
-  printf 'ghost-wispr provision: the journal of %s:\n' "$unit"
-  sudo journalctl -u "$unit" --no-pager --output=cat || printf 'ghost-wispr provision: could not read the journal of %s\n' "$unit"
+  result=succeeded
+  ((status == 0)) || result=failed
+  printf 'ghost-wispr provision: %s.service, the Serve apply, %s (exit %s); read its lines, which can hold a tailscale login URL, with: sudo journalctl -u %s.service\n' \
+    "$unit" "$result" "$status" "$unit"
   sudo rm -f -- "$SERVE_APPLY"
   if ((status == SERVE_APPLY_BUSY)); then
-    fail "the recorder records a conversation, holds a call or gives no status (its line is above), so Serve was not reset and nothing in Serve was changed: run provision.sh again when no conversation is recorded and no call is live"
+    fail "the recorder records a conversation, holds a call or gives no status, so Serve was not reset and nothing in Serve was changed; its journal says why: sudo journalctl -u $unit.service. Run provision.sh again when no conversation is recorded and no call is live"
   fi
   if ((status != 0)); then
-    if live=$(serve_status_json) && now=$(serve_lines_from_status "$live" "$name"); then
+    if live=$(serve_status_json) && now=$(serve_lines_from_status "$live" "$name" shape); then
       if [[ -z $now ]]; then
         now='Serve is now [none], so the page is not served'
       else
-        now="Serve is now [$(paste -sd ';' <<<"$now")], not serve.conf's"
+        now="Serve is now [$(paste -sd ';' <<<"$now")], not serve.conf's ($whole)"
       fi
     else
       now='Serve cannot be read now, so the page may not be served'
     fi
-    fail "the reset and apply of Serve in $unit failed or did not end within $limit s (exit $status, its lines are above). $now: run the release's ./provision.sh again (docs/pi-setup.md, \"Apply a provisioning change\")"
+    fail "the reset and apply of Serve in $unit failed or did not end within $limit s (exit $status). $now: run the release's ./provision.sh again (docs/pi-setup.md, \"Apply a provisioning change\")"
   fi
   live=$(serve_status_json) \
     || fail "could not read Tailscale Serve's setting (tailscale serve status --json) after provision.sh applied serve.conf"
   have=$(serve_lines_from_status "$live" "$name") \
-    || fail "Tailscale Serve holds a part that provision.sh cannot read after it reset Serve and applied serve.conf: read it with tailscale serve status"
-  [[ $have == "$serve_lines" ]] \
-    || fail "Tailscale Serve's setting is not serve.conf's after provision.sh applied it: want [$(paste -sd ';' <<<"$serve_lines")], have [$(paste -sd ';' <<<"$have")]"
+    || fail "Tailscale Serve holds a part that provision.sh cannot read after it reset Serve and applied serve.conf: $whole"
+  if [[ $have != "$serve_lines" ]]; then
+    shape=$(serve_lines_from_status "$live" "$name" shape) || shape=''
+    fail "Tailscale Serve's setting is not serve.conf's after provision.sh applied it: want [$(paste -sd ';' <<<"$serve_lines")], have [$(paste -sd ';' <<<"${shape:-none}")] ($whole)"
+  fi
 }
 
 # refuse_overrides WHERE HOW NAMES: fails while NAMES, the variables of PI_LIB_CONFIG_FILE_VARIABLE
@@ -812,9 +840,11 @@ if [[ ${GHOST_WISPR_PROVISION_IN_UNIT:-} != 1 || -z ${INVOCATION_ID:-} ]]; then
 fi
 provision_stop_traps
 # The run's start, which start_provision_unit reads to tell a run that failed from one that never
-# started.
+# started. dd's conv=nocreat opens the caller's marker without O_CREAT, so the run makes no file in
+# place of a marker that a caller removed when a signal ended it, and no check comes before the
+# write for a removal to fall after (GPT-6.1 Sol's review of #208). Bash's > and <> create a file.
 if [[ -n ${GHOST_WISPR_PROVISION_STARTED:-} ]]; then
-  printf 'started\n' >"$GHOST_WISPR_PROVISION_STARTED"
+  printf 'started\n' | dd of="$GHOST_WISPR_PROVISION_STARTED" conv=nocreat,notrunc status=none 2>/dev/null || true
 fi
 # The join again, now that this run holds the run's name: a join can have become active after the
 # check before the start (GPT-6.1 Sol's review of #203, round 6). Before any mode changes a file.
@@ -909,15 +939,16 @@ systemctl --user enable --now ghost-wispr-update.timer
 # The nightly update, now: it installs the latest release's whole deploy set and its secrets, and
 # restarts the recorder on them. A start of the unit, never a run of the launcher or update.sh, so
 # systemd joins it with a start of the timer at the same moment. The unit's lines are in the system
-# journal: the Pi keeps no user journal.
+# journal: the Pi keeps no user journal. The run says how the update ended and names the command
+# that reads this run's lines, as it copies no unit's lines into its own (GPT-6.1 Sol's review of
+# #208, round 2).
 printf 'ghost-wispr provision: starting the nightly update now (systemctl --user start ghost-wispr-update.service)\n'
 update_status=0
 systemctl --user start ghost-wispr-update.service || update_status=$?
-printf 'ghost-wispr provision: the journal of ghost-wispr-update.service for this run:\n'
-sudo journalctl _SYSTEMD_USER_UNIT=ghost-wispr-update.service --since="@$update_started" --no-pager --output=cat \
-  || printf 'ghost-wispr provision: could not read the journal of ghost-wispr-update.service\n'
+update_journal="sudo journalctl _SYSTEMD_USER_UNIT=ghost-wispr-update.service --since=@$update_started"
 ((update_status == 0)) \
-  || fail "the nightly update failed (systemctl --user start ghost-wispr-update.service exited $update_status): its lines are above; fix the cause and run provision.sh again"
+  || fail "the nightly update failed (systemctl --user start ghost-wispr-update.service exited $update_status); read this run's lines with: $update_journal; fix the cause and run provision.sh again"
+printf "ghost-wispr provision: ghost-wispr-update.service, the nightly update, succeeded (exit 0); read this run's lines with: %s\n" "$update_journal"
 systemctl --user enable ghost-wispr.service
 
 apply_serve
@@ -925,7 +956,7 @@ apply_serve
 # Whether the node is joined already, read in TAILSCALE_CALL_TIMEOUT s like each tailscale call: a
 # read that hangs would hold the run, and refuse every later one, for good (Sol's review of #203,
 # round 3).
-if ! self_status=$(timeout --kill-after=5s "${TAILSCALE_CALL_TIMEOUT}s" tailscale status --self --json); then
+if ! self_status=$(timeout --kill-after=5s "${TAILSCALE_CALL_TIMEOUT}s" tailscale status --self --json 2>/dev/null); then
   fail "could not read this device's tailnet status (tailscale status --self --json) before the join, in $TAILSCALE_CALL_TIMEOUT s: no join was started; run provision.sh again"
 fi
 if jq -e --arg hostname "$TAILSCALE_HOSTNAME" '
@@ -936,6 +967,12 @@ if jq -e --arg hostname "$TAILSCALE_HOSTNAME" '
 fi
 
 readonly token_audience="api.tailscale.com/$PI_TAILNET_CLIENT_ID"
+# google-id-token prints the token alone on its standard output, which stays in id_token. Its error
+# output reaches the run's output: it is the one line that says why the join cannot start (a
+# certificate that no longer signs in, say), and it holds neither a token nor any part of what
+# Google answered (internal/googleauth: impersonationError keeps only the status and the code,
+# TestARefusedIDTokenQuotesNothingIAMSent; TestNoCredentialLogsItsTokenAtSDKDebug). The run's unit
+# gets no GOOGLE_SDK_GO_LOGGING_LEVEL from its caller (PI_LIB_PROVISION_SETTINGS).
 id_token=$(env \
   GOOGLE_API_USE_CLIENT_CERTIFICATE=false \
   "$DEPLOY_DIR/ghost-wispr" google-id-token --credentials "$DEPLOY_DIR/google-credentials.json" --audience "$token_audience")

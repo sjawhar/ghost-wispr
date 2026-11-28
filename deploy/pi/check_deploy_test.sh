@@ -196,16 +196,23 @@ EOF
 
 # tailscale on the fake Pi: serve status --json prints state/serve.json, the Serve config as
 # tailscaled gives it, to root alone (sudo). status --self --json, which any user may run, prints
-# state/self.json, the device's own status. With no such file, tailscaled does not answer.
+# state/self.json, the device's own status. With no such file, tailscaled does not answer. A call
+# that fails first prints state/tailscale-stderr, when there is one, on its error output, as
+# tailscale prints a logged-out device's login URL there.
 cat >"$bin/tailscale" <<'EOF'
 #!/usr/bin/env bash
+refuse() {
+  [[ ! -f $FAKE_STATE/tailscale-stderr ]] || cat -- "$FAKE_STATE/tailscale-stderr" >&2
+  echo "$1" >&2
+  exit 1
+}
 if [[ $* == 'status --self --json' ]]; then
-  [[ -f $FAKE_STATE/self.json ]] || { echo 'failed to connect to local tailscaled' >&2; exit 1; }
+  [[ -f $FAKE_STATE/self.json ]] || refuse 'failed to connect to local tailscaled'
   exec cat -- "$FAKE_STATE/self.json"
 fi
 [[ $* == 'serve status --json' ]] || { printf 'fake tailscale: unexpected arguments: %s\n' "$*" >&2; exit 1; }
-[[ ${FAKE_SUDO:-} == 1 ]] || { echo 'Access denied: serve config denied' >&2; exit 1; }
-[[ -f $FAKE_STATE/serve.json ]] || { echo 'failed to connect to local tailscaled' >&2; exit 1; }
+[[ ${FAKE_SUDO:-} == 1 ]] || refuse 'Access denied: serve config denied'
+[[ -f $FAKE_STATE/serve.json ]] || refuse 'failed to connect to local tailscaled'
 cat -- "$FAKE_STATE/serve.json"
 EOF
 
@@ -899,11 +906,28 @@ run_driver
 [[ -e $state/ssh-lost-fired ]] || fail "SSH was never lost: the driver did not read ghost-wispr-update.service: $out"
 expect_verdicts PASS PASS PASS PASS PASS PASS FAIL
 expect 7 FAIL ghost-wispr-update-launcher.sh SSH
+# A Serve that differs: check 7 names each handler of the Pi's Serve by its port, path and kind,
+# never by its value, and the command that shows the whole setting (GPT-6.1 Sol's review of #208,
+# round 3). Break it catches: a line that prints the Pi's proxy target.
 new_case 'a Serve target that differs'
 jq -c '.Web[].Handlers["/"].Proxy = "http://127.0.0.1:9090"' <<<"$good_serve" >"$state/serve.json"
 run_driver
 expect_verdicts PASS PASS PASS PASS PASS PASS FAIL
-expect 7 FAIL Serve 'http://127.0.0.1:9090' 'http://127.0.0.1:8080'
+expect 7 FAIL Serve 'have 443 "/" proxy' 'http://127.0.0.1:8080' 'read the whole setting on the Pi with: sudo tailscale serve status'
+[[ $(verdict_line 7) != *9090* ]] || fail "check 7 names the Pi's proxy target: $(verdict_line 7)"
+# Handlers that hold text someone set, each with a canary: a Text body, a redirect and a proxy
+# target. The control: the Serve status the driver reads holds all three. Break it catches: a check
+# 7 that prints Serve's lines as the comparison reads them, values and all.
+new_case 'Serve handlers that hold text'
+jq -c --arg host "$PI_HOST" '.Web[$host + ":443"].Handlers["/"].Proxy = "http://127.0.0.1:9/dummy-serve-proxy-canary"
+  | .Web[$host + ":443"].Handlers["/note"] = {Text: "dummy-serve-text-canary"}
+  | .TCP["8443"] = {HTTPS: true} | .Web[$host + ":8443"] = {Handlers: {"/": {Redirect: "https://example.test/dummy-serve-redirect-canary"}}}' \
+  <<<"$good_serve" >"$state/serve.json"
+[[ $(grep -o 'dummy-serve-[a-z]*-canary' "$state/serve.json" | grep -c .) == 3 ]] || fail "control: the Serve status holds no three canaries: $(<"$state/serve.json")"
+run_driver
+expect_verdicts PASS PASS PASS PASS PASS PASS FAIL
+expect 7 FAIL 'have 443 "/" proxy,443 "/note" text,8443 "/" redirect'
+! grep -q 'dummy-serve-[a-z]*-canary' <<<"$out" || fail "the driver printed what a Serve handler holds: $out"
 # An empty Serve, as a Serve apply cut short after its reset leaves it (GPT-6.1 Sol's review of #203):
 # the page is not served, and the nightly update never changes Serve (spec R16), so check 7 fails
 # and names the one command that applies serve.conf again. Break it catches: a check 7 whose line
@@ -941,12 +965,33 @@ new_case 'a Serve entry of the name the Pi had before a rename'
 cp -- "$script_dir/testdata/serve-status-after-rename.json" "$state/serve.json"
 run_driver
 expect_verdicts PASS PASS PASS PASS PASS PASS FAIL
-expect 7 FAIL Serve 'http://127.0.0.1:8080 on ghost-wispr-1.example-tailnet.ts.net'
+expect 7 FAIL Serve '443 "/" proxy on ghost-wispr-1.example-tailnet.ts.net'
 new_case "the Pi's tailnet name cannot be read"
 rm -f -- "$state/self.json"
 run_driver
 expect_verdicts PASS PASS PASS PASS PASS PASS UNKNOWN
 expect 7 UNKNOWN 'tailscale status --self --json'
+# A failed read of Serve or of the device's name whose error output holds a login URL, as tailscale
+# prints one for a logged-out device (GPT-6.1 Sol's review of #208, round 4). Check 7 names the
+# command, its exit status and the command a person runs on the Pi to see why, and copies nothing
+# of that output. The control: the fake's error output holds the canary. Break it catches: a check
+# 7 line that quotes a tailscale command's error output.
+printf 'Log in at: https://login.tailscale.com/a/dummy-check-login-canary\n' >"$work/tailscale-stderr"
+control=$(FAKE_STATE=$work FAKE_REAL_CAT=$real_cat PATH="$bin:$PATH" tailscale status --self --json 2>&1 >/dev/null || true)
+[[ $control == *dummy-check-login-canary* ]] || fail "control: the fake tailscale prints no canary on its error output: $control"
+for read in serve self; do
+  new_case "a failed $read read whose error output holds a login URL"
+  cp -- "$work/tailscale-stderr" "$state/tailscale-stderr"
+  rm -f -- "$state/$read.json"
+  run_driver
+  expect_verdicts PASS PASS PASS PASS PASS PASS UNKNOWN
+  if [[ $read == serve ]]; then
+    expect 7 UNKNOWN 'timeout 10s sudo -n tailscale serve status --json, exit 1' 'run it on the Pi to see why: sudo tailscale serve status --json'
+  else
+    expect 7 UNKNOWN 'timeout 10s tailscale status --self --json, exit 1' 'run it on the Pi to see why: tailscale status --self --json'
+  fi
+  ! grep -q dummy-check-login-canary <<<"$out" || fail "the driver printed a failed tailscale read's error output: $out"
+done
 
 # The driver reads the bootstrap files and Serve with the functions of the pi-lib.sh beside it,
 # bootstrap_drift, serve_conf_lines and serve_lines_from_status, which update.sh's nightly drift
