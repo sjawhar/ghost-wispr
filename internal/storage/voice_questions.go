@@ -181,13 +181,6 @@ func ReadVoiceQuestions(db *sql.DB, since time.Time) ([]VoiceQuestion, error) {
 // segment's edge goes with it.
 const questionHeardSlack = time.Second
 
-// untimedSegmentLag is how long before an untimed segment's flush the words
-// of the flush can have begun after the flush before it ended: a flush
-// stores the words Deepgram finalized since the last, after the endpoint or
-// utterance end (400 ms and 1000 ms on the unit) and the result's own way
-// back.
-const untimedSegmentLag = 3 * time.Second
-
 // eraseQuestionsHeardIn deletes, in tx, the question log's rows of sessions
 // whose heard span overlaps from to to, widened by questionHeardSlack: the
 // questions whose words a segment deletion took off the unit. It records the
@@ -230,53 +223,22 @@ func eraseQuestionsHeardInRecording(tx *sql.Tx, sessionID, recording, sha string
 
 func seconds(s float64) time.Duration { return time.Duration(s * float64(time.Second)) }
 
-// untimedFlushGap is how far apart two untimed segments' stored times must
-// be for the earlier to be a flush of its own: the segments of one flush are
-// stored within milliseconds of each other.
-const untimedFlushGap = time.Second
-
 // untimedHeardFrom is the earliest the words of an untimed segment of
-// session sessionID, stored at storedAt, can have been said: the latest
-// flush of the same source before the segment's (its untimed segments
-// stored at least untimedFlushGap earlier), or, with none, the start of the
-// source session, then untimedSegmentLag before. sourceID names the source
-// (segments.untimed_source_id); "" is sessionID itself.
-func untimedHeardFrom(tx *sql.Tx, sessionID, sourceID string, storedAt time.Time) (time.Time, error) {
-	rows, err := tx.Query(`SELECT timestamp FROM segments WHERE session_id = ? AND untimed = 1 AND untimed_source_id = ?`, sessionID, sourceID)
+// session sessionID can have been said: the start of the session it came
+// from (sourceID, segments.untimed_source_id; "" is sessionID itself). An
+// untimed segment keeps no capture time: its stored time is when its result
+// came, and a result can come long after its words, as results replayed
+// after an outage do, so no other segment's stored time bounds its words.
+func untimedHeardFrom(tx *sql.Tx, sessionID, sourceID string) (time.Time, error) {
+	source := sourceID
+	if source == "" {
+		source = sessionID
+	}
+	session, err := getSession(tx, source)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("read the untimed segments of session %s: %w", sessionID, err)
+		return time.Time{}, fmt.Errorf("read the session an untimed segment came from: %w", err)
 	}
-	var earlier time.Time
-	for rows.Next() {
-		var stored string
-		if err := rows.Scan(&stored); err != nil {
-			_ = rows.Close()
-			return time.Time{}, fmt.Errorf("read the untimed segments of session %s: %w", sessionID, err)
-		}
-		at, err := time.Parse(time.RFC3339Nano, stored)
-		if err != nil {
-			_ = rows.Close()
-			return time.Time{}, fmt.Errorf("read an untimed segment's time in session %s: %w", sessionID, err)
-		}
-		if at.Before(storedAt.Add(-untimedFlushGap)) && at.After(earlier) {
-			earlier = at
-		}
-	}
-	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
-		return time.Time{}, fmt.Errorf("read the untimed segments of session %s: %w", sessionID, err)
-	}
-	if earlier.IsZero() {
-		source := sourceID
-		if source == "" {
-			source = sessionID
-		}
-		session, err := getSession(tx, source)
-		if err != nil {
-			return time.Time{}, fmt.Errorf("read the session an untimed segment came from: %w", err)
-		}
-		earlier = session.StartedAt
-	}
-	return earlier.Add(-untimedSegmentLag), nil
+	return session.StartedAt, nil
 }
 
 // unsplice maps a time on recording as its bytes are now (hash sha) to the

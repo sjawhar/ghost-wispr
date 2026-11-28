@@ -35,15 +35,10 @@ type openQuestion struct {
 // (exchange.questions): heard is the turn as the room said it, past its last
 // take-back, and vendor a driving voice's own wording of it, kept only when it
 // differs. from and to are when its words were said; zero is the turn now
-// heard (exchange.wordsFrom, wordsTo). A row ex holds whose answer came and
-// its voice never spoke is written first, with the outcome it has; one whose
-// Answer still runs stays open. s.mu is held.
+// heard (exchange.wordsFrom, wordsTo). The questions ex holds already stay
+// open: each is written once its own answer played to its end or was cut
+// (Sol's review of #195). s.mu is held.
 func (s *Supervisor) openQuestionLocked(ex *exchange, heard, vendor string, askedAt, from, to time.Time) *openQuestion {
-	for _, prev := range slices.Clone(ex.questions) {
-		if prev.answered {
-			s.settleQuestionLocked(ex, prev, "")
-		}
-	}
 	if from.IsZero() {
 		from, to = ex.wordsFrom, ex.wordsTo
 	}
@@ -64,9 +59,10 @@ func (s *Supervisor) openQuestionLocked(ex *exchange, heard, vendor string, aske
 // take-back the Supervisor did not cut or the whole reply to Wispr's
 // question, replace the heard words, and the vendor's wording goes: it may
 // hold what the room took back. The row is written now when the outcome is
-// known already: the exchange ended or cut the turn while Answer ran, a later
-// turn opened after it, or a driving voice was given nothing to say (silent).
-// s.mu is held.
+// known already: the exchange ended or cut the turn while Answer ran, or a
+// driving voice was given nothing to say (silent). Else it waits for its
+// answer's audio (exchange.answerAwaitsAudio) to play to its end, or for a
+// cut, whatever other turn opens or returns meanwhile. s.mu is held.
 func (s *Supervisor) answeredLocked(ex *exchange, q *openQuestion, x *Exchange, err error, silent bool) {
 	q.answered, q.answeredAt = true, time.Now()
 	q.q.IssueKey = x.IssueKey
@@ -74,8 +70,31 @@ func (s *Supervisor) answeredLocked(ex *exchange, q *openQuestion, x *Exchange, 
 	if x.Asked != q.q.Heard {
 		q.q.Heard, q.q.VendorWording = x.Asked, ""
 	}
-	if ex.ended || q.cut != "" || silent || ex.questions[len(ex.questions)-1] != q {
+	if ex.ended || q.cut != "" || silent {
 		s.settleQuestionLocked(ex, q, "")
+		return
+	}
+	ex.answerAwaitsAudio.Store(true)
+}
+
+// answerAudio takes the first audio a driving voice writes through any of
+// ex's playbacks after an answer came (sayPlayback.Write): each answered
+// question of ex is playing now, and the speech it plays in ends its turn
+// (driverSpeechLocked). Audio written into a speech already playing plays as
+// soon as queued, with no speech start of its own: that is its first audio.
+func (s *Supervisor) answerAudio(ex *exchange) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ex.answerAwaitsAudio.Store(false)
+	now := time.Now()
+	for _, q := range ex.questions {
+		if !q.answered {
+			continue
+		}
+		q.playing = true
+		if q.firstAudio.IsZero() && s.voiceSpeaking && s.speechEx == ex {
+			q.firstAudio = now
+		}
 	}
 }
 

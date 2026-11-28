@@ -748,7 +748,11 @@ What the voice hears, and where the room's words go:
   never mind" cancels is kept as `never_mind` with its times and no words.
   A segment delete erases each question whose words were said within a second of the segment's
   span, placed by when the words were said, also after an earlier "Delete text and audio"
-  shortened the recording, and a question the unit writes after that delete is not kept.
+  shortened the recording, and a question the unit writes after that delete is not kept. A
+  segment of a merged session that has no recording keeps no time its words were said, so its
+  delete erases every question of the session it came from asked before the segment was stored.
+  When voice B or C asks for an answer after a stop or "Wispr, never mind", the unit refuses it and
+  keeps nothing of it.
   `ghost-wispr voice questions [--since DATE] [--json]` prints the log, read without writing to
   the database.
 - The `voice_tasks` ledger of questions sent to agents holds none of the room's words: it holds

@@ -44,14 +44,14 @@ func (s *SQLiteStore) deleteUntimedSegmentText(sessionID string, segmentID int64
 		}
 		return fmt.Errorf("read untimed segment %d: %w", segmentID, err)
 	}
-	// An untimed segment holds when its live result was stored, which waits
-	// for the end of the utterance: its words were said after the flush
-	// before it (untimedHeardFrom) and before it was stored.
+	// An untimed segment holds when its live result was stored, after its
+	// words; it keeps no capture time, so its words were said after its
+	// source session began (untimedHeardFrom) and before it was stored.
 	storedAt, err := time.Parse(time.RFC3339Nano, stored)
 	if err != nil {
 		return fmt.Errorf("read untimed segment %d's time: %w", segmentID, err)
 	}
-	heardFrom, err := untimedHeardFrom(tx, sessionID, untimedSourceID, storedAt)
+	heardFrom, err := untimedHeardFrom(tx, sessionID, untimedSourceID)
 	if err != nil {
 		return err
 	}

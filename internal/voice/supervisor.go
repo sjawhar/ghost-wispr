@@ -631,6 +631,10 @@ type exchange struct {
 	questions          []*openQuestion
 	claimedSpans       map[string][][2]time.Time
 	endedAs            QuestionOutcome
+	// answerAwaitsAudio: an answered question waits for its first audio, so
+	// a playback's next write marks it playing (answerAudio). A playback
+	// reads it on each frame without the lock; it is set under s.mu.
+	answerAwaitsAudio atomic.Bool
 }
 
 // NewSupervisor starts a Supervisor; Close stops it.
@@ -3996,15 +4000,8 @@ func (o exchangeOutput) Begin() Playback {
 	}
 	// The playback is ex's: the speech its audio starts carries ex on its
 	// start and end (audio.SpeechEvent.Owner), which onSpeech reads.
-	pb := sayPlayback{Playback: o.s.cfg.Speaker.Begin(audio.InputVoice, o.ex), ctx: authority, joins: &frameJoin{}}
+	pb := sayPlayback{Playback: o.s.cfg.Speaker.Begin(audio.InputVoice, o.ex), ctx: authority, joins: &frameJoin{}, s: o.s, ex: o.ex}
 	o.ex.last = pb
-	// A playback begun once an answer came speaks it: the speech it plays
-	// in ends the answer's turn (driverSpeechLocked).
-	for _, q := range o.ex.questions {
-		if q.answered {
-			q.playing = true
-		}
-	}
 	return pb
 }
 
@@ -4035,6 +4032,12 @@ type sayPlayback struct {
 	Playback
 	ctx   context.Context
 	joins *frameJoin
+	// s and ex, when set, are the exchange whose answer the playback can
+	// speak: its first audio written after an answer came marks the answer
+	// played (answerAudio), whether the playback began before the answer or
+	// after, as voice B keeps one playback across its audio.
+	s  *Supervisor
+	ex *exchange
 }
 
 // frameJoin keeps the last context a playback was written under, joined with
@@ -4075,7 +4078,13 @@ func (p sayPlayback) Write(ctx context.Context, frame []byte, format audio.Audio
 	if err := both.Err(); err != nil {
 		return err
 	}
-	return p.Playback.Write(both, frame, format)
+	if err := p.Playback.Write(both, frame, format); err != nil {
+		return err
+	}
+	if p.ex != nil && p.ex.answerAwaitsAudio.Load() {
+		p.s.answerAudio(p.ex)
+	}
+	return nil
 }
 
 func (p sayPlayback) Drain(ctx context.Context) error {
@@ -4274,6 +4283,10 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 	case askedBack && reply == "":
 		// Side talk after Wispr's question, which the question log keeps.
 		s.mu.Lock()
+		if t.ex.ended {
+			s.mu.Unlock()
+			return nil, errExchangeEnded
+		}
 		heard, taken := s.pastTakeBack(turn)
 		if taken {
 			vendor = ""
@@ -4292,6 +4305,14 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 	// The turn as heard by now: a follow-up's final may have come while
 	// followUpTurn waited for it.
 	s.mu.Lock()
+	// A stop, a never mind or the exchange's end before now answers nothing
+	// more: the call gets no question, its words go nowhere, and the
+	// Concierge is not called. Read with the question's opening, under one
+	// lock, after every wait for the room's words (Sol's review of #195).
+	if t.ex.ended {
+		s.mu.Unlock()
+		return nil, errExchangeEnded
+	}
 	x = t.ex.x
 	// The room's recent words as they are now, aged, and cut by the one
 	// parse over the retained segments (modelViewLocked): the exchange's
