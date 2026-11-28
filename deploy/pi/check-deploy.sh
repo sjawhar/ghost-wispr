@@ -688,11 +688,16 @@ listed() {
   done
   return 1
 }
+# Check 7's reads of Serve's setting and of the Pi's tailnet name, which tells its own Serve entries
+# from those of another name. Each runs on the Pi with its error output sent nowhere there, as
+# tailscale prints a logged-out device's login URL on it (GPT-6.1 Sol's review of #208, round 4);
+# a failure names the command, its exit status, and the command a person runs on the Pi to see why.
+# Only ssh's own error output comes back.
 readonly SERVE_READ='timeout 10s sudo -n tailscale serve status --json'
-# The Pi's tailnet name, which tells its own Serve entries from those of another name.
 readonly SELF_READ='timeout 10s tailscale status --self --json'
 check_bootstrap() {
   local differences=() unread=() missing=() unreadable=() reached=yes status=0 name remote copy drift want serve have shape self device
+  local self_status=0
   if [[ -z $set_dir ]]; then
     unknown 7 "no release manifest and serve.conf to compare the Pi's bootstrap files and Serve with: $set_error"
     return 0
@@ -760,13 +765,18 @@ check_bootstrap() {
   elif [[ -z $want ]]; then
     unread+=("$release_name's serve.conf names no port")
   else
-    serve=$(pi "$SERVE_READ" 2>"$tmp/serve.err") || status=$?
+    serve=$(pi "$SERVE_READ 2>/dev/null" 2>"$tmp/serve.err") || status=$?
+    if ((status == 0)); then
+      self=$(pi "$SELF_READ 2>/dev/null" 2>"$tmp/self.err") || self_status=$?
+    fi
     if ((status == 255)); then
       unread+=("cannot reach $PI over SSH to read Serve's setting: $(error_of "$tmp/serve.err")")
     elif ((status != 0)); then
-      unread+=("cannot read Serve's setting on the Pi ($SERVE_READ, exit $status): $(error_of "$tmp/serve.err")")
-    elif ! self=$(pi "$SELF_READ" 2>"$tmp/self.err"); then
-      unread+=("cannot read the Pi's tailnet name, which its Serve entries are read for ($SELF_READ): $(error_of "$tmp/self.err")")
+      unread+=("cannot read Serve's setting on the Pi ($SERVE_READ, exit $status); run it on the Pi to see why: sudo tailscale serve status --json")
+    elif ((self_status == 255)); then
+      unread+=("cannot reach $PI over SSH to read the Pi's tailnet name: $(error_of "$tmp/self.err")")
+    elif ((self_status != 0)); then
+      unread+=("cannot read the Pi's tailnet name, which its Serve entries are read for ($SELF_READ, exit $self_status); run it on the Pi to see why: tailscale status --self --json")
     elif ! device=$(device_tailnet_name "$self"); then
       unread+=("cannot read the Pi's tailnet name, which its Serve entries are read for: $SELF_READ gave no DNSName")
     elif ! have=$(serve_lines_from_status "$serve" "$device"); then
