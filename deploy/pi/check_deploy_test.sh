@@ -196,16 +196,23 @@ EOF
 
 # tailscale on the fake Pi: serve status --json prints state/serve.json, the Serve config as
 # tailscaled gives it, to root alone (sudo). status --self --json, which any user may run, prints
-# state/self.json, the device's own status. With no such file, tailscaled does not answer.
+# state/self.json, the device's own status. With no such file, tailscaled does not answer. A call
+# that fails first prints state/tailscale-stderr, when there is one, on its error output, as
+# tailscale prints a logged-out device's login URL there.
 cat >"$bin/tailscale" <<'EOF'
 #!/usr/bin/env bash
+refuse() {
+  [[ ! -f $FAKE_STATE/tailscale-stderr ]] || cat -- "$FAKE_STATE/tailscale-stderr" >&2
+  echo "$1" >&2
+  exit 1
+}
 if [[ $* == 'status --self --json' ]]; then
-  [[ -f $FAKE_STATE/self.json ]] || { echo 'failed to connect to local tailscaled' >&2; exit 1; }
+  [[ -f $FAKE_STATE/self.json ]] || refuse 'failed to connect to local tailscaled'
   exec cat -- "$FAKE_STATE/self.json"
 fi
 [[ $* == 'serve status --json' ]] || { printf 'fake tailscale: unexpected arguments: %s\n' "$*" >&2; exit 1; }
-[[ ${FAKE_SUDO:-} == 1 ]] || { echo 'Access denied: serve config denied' >&2; exit 1; }
-[[ -f $FAKE_STATE/serve.json ]] || { echo 'failed to connect to local tailscaled' >&2; exit 1; }
+[[ ${FAKE_SUDO:-} == 1 ]] || refuse 'Access denied: serve config denied'
+[[ -f $FAKE_STATE/serve.json ]] || refuse 'failed to connect to local tailscaled'
 cat -- "$FAKE_STATE/serve.json"
 EOF
 
@@ -964,6 +971,27 @@ rm -f -- "$state/self.json"
 run_driver
 expect_verdicts PASS PASS PASS PASS PASS PASS UNKNOWN
 expect 7 UNKNOWN 'tailscale status --self --json'
+# A failed read of Serve or of the device's name whose error output holds a login URL, as tailscale
+# prints one for a logged-out device (GPT-6.1 Sol's review of #208, round 4). Check 7 names the
+# command, its exit status and the command a person runs on the Pi to see why, and copies nothing
+# of that output. The control: the fake's error output holds the canary. Break it catches: a check
+# 7 line that quotes a tailscale command's error output.
+printf 'Log in at: https://login.tailscale.com/a/dummy-check-login-canary\n' >"$work/tailscale-stderr"
+control=$(FAKE_STATE=$work FAKE_REAL_CAT=$real_cat PATH="$bin:$PATH" tailscale status --self --json 2>&1 >/dev/null || true)
+[[ $control == *dummy-check-login-canary* ]] || fail "control: the fake tailscale prints no canary on its error output: $control"
+for read in serve self; do
+  new_case "a failed $read read whose error output holds a login URL"
+  cp -- "$work/tailscale-stderr" "$state/tailscale-stderr"
+  rm -f -- "$state/$read.json"
+  run_driver
+  expect_verdicts PASS PASS PASS PASS PASS PASS UNKNOWN
+  if [[ $read == serve ]]; then
+    expect 7 UNKNOWN 'timeout 10s sudo -n tailscale serve status --json, exit 1' 'run it on the Pi to see why: sudo tailscale serve status --json'
+  else
+    expect 7 UNKNOWN 'timeout 10s tailscale status --self --json, exit 1' 'run it on the Pi to see why: tailscale status --self --json'
+  fi
+  ! grep -q dummy-check-login-canary <<<"$out" || fail "the driver printed a failed tailscale read's error output: $out"
+done
 
 # The driver reads the bootstrap files and Serve with the functions of the pi-lib.sh beside it,
 # bootstrap_drift, serve_conf_lines and serve_lines_from_status, which update.sh's nightly drift
