@@ -1053,7 +1053,7 @@ A run of `update.sh`:
    installs the three system files with `sudo -n`, only when they change. Then it reloads the user
    units, reloads udev, restarts logind, or restarts journald and moves the boot's journal to the
    card (`journalctl --flush`), each when its file changed (journald also when it does not run the
-   installed setting yet, "The Pi's journal"), restarts the recorder, and waits up to 120 s for
+   installed setting, "The Pi's journal"), restarts the recorder, and waits up to 120 s for
    `/api/version` to answer the release's commit and for `/api/status` to answer a status
    it can read, whose `call`, when it has one, is an object: a release whose status the update
    cannot read would stop each later run at its first status read, before it could install a fix.
@@ -1219,23 +1219,29 @@ about seven months at the rate of 2026-11; `SystemKeepFree=5G` for the recording
 `SystemMaxFileSize=64M`; and journald's default `SyncIntervalSec=5m`: a longer interval writes the
 card less, but loses more of the lines before a power cut.
 
-journald itself reports what it runs. At each flush and rotation it logs, from its own PID, a usage
-line, "System Journal (/var/log/journal/<machine-id>) is …, max …, … free." (`MESSAGE_ID`
+journald itself reports what it runs. At its start, and at each rotation that
+`journalctl --rotate` asks for, it logs from its own PID a usage line, "System Journal
+(/var/log/journal/<machine-id>) is …, max …, … free." (`MESSAGE_ID`
 `ec387f577b844b8fa948f33cad9a75e6`), whose fields name the journal it writes and the `SystemMaxUse`
 and `SystemKeepFree` it read at its start; it reads its setting at no other time. After each install
 or rollback, and on the current release too, the update reads the newest such line of this boot
-from journald's PID. When journald has logged none, or the line differs from its setting as
-`systemd-analyze cat-config` gives it, the update restarts journald and flushes the journal, and
-reads the line again; an install whose journald still differs rolls back. check 8 of
-`check-deploy.sh` fails when another drop-in overrides one of the release's values, when the
-running journald has no journal on the card open or has one in `/run`, or when its usage line
-differs from its setting. Neither reads a clock or a file's change time: the Pi has no real-time
-clock, and network time steps its clock. The line shows no `SplitMode`, `SystemMaxFileSize` or
-`SyncIntervalSec`; the update restarts journald for any change of its setting's file. Boots before
-the first install of this setting are gone.
+from journald's PID, and compares it with the setting as `systemd-analyze cat-config` gives it.
+When the journal no longer holds the line, as after journald deleted its oldest files under its
+cap, the update asks for a rotation, which makes journald log one, and compares again. When the line
+differs, or still is missing, the update restarts journald, flushes the journal and compares again;
+an install whose journald still differs rolls back. So journald restarts only when it runs another
+setting, as a restart can come during a recording. check 8 of `check-deploy.sh` fails when another
+drop-in overrides one of the release's values, when the running journald has no journal on the
+card open or has one in `/run`, or when its usage line differs from its setting. Neither reads a
+clock or a file's change time: the Pi has no real-time clock, and network time steps its clock.
+The line shows no `SplitMode`, `SystemMaxFileSize` or `SyncIntervalSec`; the update restarts
+journald for any change of its setting's file. Boots before the first install of this setting are
+gone.
 
-When check 8 says journald has logged no usage line, run `sudo -n journalctl --flush` on the Pi,
-which makes journald log one, and check again.
+When check 8 says journald has logged no usage line that the journal still holds, run
+`sudo -n journalctl --rotate` on the Pi, which makes journald log one and starts new journal files,
+and check again. `journalctl --flush` makes none: once the journal is flushed, it asks journald for
+nothing.
 
 List the boots the journal holds, then read the recorder's lines of the boot before this one, and
 that boot's kernel lines (USB devices such as the Jabra):

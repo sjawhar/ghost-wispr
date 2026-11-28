@@ -410,8 +410,10 @@ bootstrap_drift() {
 }
 
 # The MESSAGE_ID of the line that journald logs on its own storage, "<name> (<path>) is <use>, max
-# <max>, <free> free.", from its own PID (_TRANSPORT=driver), at each flush of the journal and each
-# rotation (systemd v255 to v257, src/journal/journald-server.c, server_space_usage_message). Its
+# <max>, <free> free.", from its own PID (_TRANSPORT=driver): at its start (src/journal/journald.c),
+# at each rotation that journalctl --rotate asks for, and at a flush that journald does (systemd
+# v255 to v257, src/journal/journald-server.c, server_space_usage_message). journalctl --flush asks
+# journald for nothing once /run/systemd/journal/flushed exists, so it makes no line then. Its
 # JOURNAL_PATH is the journal it writes, /var/log/journal/<machine-id> or
 # /run/log/journal/<machine-id>, and its MAX_USE and DISK_KEEP_FREE are the limits that this journald
 # runs, which it read from its setting at its start: journald reads its setting at no other time.

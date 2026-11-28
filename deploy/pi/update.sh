@@ -559,9 +559,11 @@ sudo_install() {
 # reload_system NAME... reloads udev after the udev rule changed, restarts logind after the logind
 # setting changed, and restarts journald after the journald setting changed, each sudo -n call under
 # its bound: udevadm control --reload, then udevadm trigger; systemctl restart systemd-journald, then
-# journalctl --flush, which moves the boot's journal from /run to /var/log/journal once journald runs
-# with persistent storage. A journald restart keeps the services' log streams open (systemd keeps
-# them in journald's file descriptor store).
+# journalctl --flush, which asks journald to move this boot's journal from /run to /var/log/journal.
+# A journald that ran with volatile storage never flushed the journal, so
+# /run/systemd/journal/flushed does not exist, and the restarted journald writes /run until that
+# flush; once the flag exists, the flush asks journald for nothing. A journald restart keeps the
+# services' log streams open (systemd keeps them in journald's file descriptor store).
 reload_system() {
   local name
   for name in "$@"; do
@@ -585,13 +587,15 @@ reload_system() {
 # Sol's review of #209, round 2). The newest usage line of this boot from journald's MainPID
 # (pi-lib.sh's PI_LIB_JOURNALD_USAGE_ID) must hold each field that journald_expected reads from its
 # setting, `systemd-analyze cat-config systemd/journald.conf` under SYSTEM_ROOT: the journal it
-# writes, and its SystemMaxUse and SystemKeepFree. A journald that has logged none since its start,
-# as one restarted with no flush after, does not count. No record of this script's stands in for it,
-# and no clock. The line shows no SplitMode, SystemMaxFileSize or SyncIntervalSec: reload_system
-# restarts journald for any change of its setting's file. It sets journald_problem to why not.
+# writes, and its SystemMaxUse and SystemKeepFree. journald logs the line at its start and at each
+# rotation that journalctl --rotate asks for. No record of this script's stands in for it, and no
+# clock. The line shows no SplitMode, SystemMaxFileSize or SyncIntervalSec: reload_system restarts
+# journald for any change of its setting's file. It sets journald_problem to why not, and
+# journald_no_line to yes when the journal holds no such line, as when journald deleted its oldest
+# files under its cap.
 journald_runs_setting() {
   local values id expected pid usage running differences card=no
-  journald_problem=''
+  journald_problem='' journald_no_line=no
   if ! values=$(systemd-analyze --root="$SYSTEM_ROOT" cat-config systemd/journald.conf 2>/dev/null | journald_conf_values ''); then
     journald_problem="could not read journald's setting (systemd-analyze cat-config systemd/journald.conf)"
     return 1
@@ -617,7 +621,8 @@ journald_runs_setting() {
     return 1
   fi
   if [[ -z $usage ]] || ! running=$(journald_running "$usage"); then
-    journald_problem="journald (PID $pid) has logged no usage line since it started"
+    journald_problem="journald (PID $pid) has logged no usage line this boot that the journal still holds"
+    journald_no_line=yes
     return 1
   fi
   differences=$(journald_differences "$expected" "$running")
@@ -627,12 +632,22 @@ journald_runs_setting() {
   fi
 }
 
-# activate_journald makes the running journald run its setting. When journald_runs_setting finds it
-# does not, it says why, restarts journald and flushes the journal, after which the new journald
-# logs its usage line, and asks again; it changes nothing when journald runs its setting. It fails,
-# with journald_problem set, when journald does not run it after the restart.
+# activate_journald makes the running journald run its setting, and restarts it only when it does
+# not (GPT-6.1 Sol's review of #209, round 3): a restart can come during a recording. When the
+# journal holds no usage line of journald's, it asks journald for a rotation, which logs one, and
+# asks again; journalctl --flush cannot, as it asks journald for nothing once the journal is
+# flushed. When journald still reports no line, or reports a setting other than its files give, it
+# says why, restarts journald, after which the new journald logs its line at its start, and flushes
+# the journal, and asks again. It changes nothing when journald runs its setting. It fails, with
+# journald_problem set, when journald does not run its setting after the restart.
 activate_journald() {
   journald_runs_setting && return 0
+  if [[ $journald_no_line == yes ]]; then
+    printf 'ghost-wispr update: %s; rotating the journal, after which journald logs it\n' "$journald_problem"
+    if timeout 30s sudo -n journalctl --rotate && journald_runs_setting; then
+      return 0
+    fi
+  fi
   printf 'ghost-wispr update: %s; restarting journald\n' "$journald_problem"
   if ! timeout 30s sudo -n systemctl restart systemd-journald; then
     journald_problem='could not restart journald'

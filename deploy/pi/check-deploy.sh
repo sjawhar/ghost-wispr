@@ -924,7 +924,7 @@ fi"
   # With no setting read, there is nothing to compare the usage line with; unread says why.
   [[ -n $runs ]] || return 0
   if [[ -z $usage ]] || ! running=$(journald_running "$usage"); then
-    unread+=("journald (PID $daemon_pid) has logged no usage line this boot since it started, as after a restart with no flush, or the journal no longer holds it, so what it runs cannot be read: run sudo journalctl --flush on the Pi, which makes journald log one, and check again")
+    unread+=("journald (PID $daemon_pid) has logged no usage line this boot that the journal still holds, as when journald deleted its oldest files under its cap, so what it runs cannot be read: run sudo -n journalctl --rotate on the Pi, which makes journald log one and starts new journal files, and check again (a flush makes none once the journal is flushed)")
     return 0
   fi
   if ! expected=$(journald_expected "$runs" "$id" "$card"); then
