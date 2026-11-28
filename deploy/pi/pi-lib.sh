@@ -408,3 +408,108 @@ bootstrap_drift() {
     fi
   done
 }
+
+# The MESSAGE_ID of the line that journald logs on its own storage, "<name> (<path>) is <use>, max
+# <max>, <free> free.", from its own PID (_TRANSPORT=driver), at each flush of the journal and each
+# rotation (systemd v255 to v257, src/journal/journald-server.c, server_space_usage_message). Its
+# JOURNAL_PATH is the journal it writes, /var/log/journal/<machine-id> or
+# /run/log/journal/<machine-id>, and its MAX_USE and DISK_KEEP_FREE are the limits that this journald
+# runs, which it read from its setting at its start: journald reads its setting at no other time.
+# shellcheck disable=SC2034 # update.sh and check-deploy.sh, which source this file, read it.
+PI_LIB_JOURNALD_USAGE_ID=ec387f577b844b8fa948f33cad9a75e6
+
+# journald_conf_values FILE reads a journald.conf on standard input, or `systemd-analyze cat-config
+# systemd/journald.conf`'s output of all of journald's setting files, and prints each key of its
+# [Journal] section as "<key>=<value><TAB><file>": its last value, which journald runs, and the file
+# that gives it (FILE for a lone file). In cat-config's output a file starts with a line "# <path>",
+# first or after a blank line; any other line that starts with # or ; is a comment.
+journald_conf_values() {
+  awk -v file="$1" '
+    { line = $0; sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+$/, "", line) }
+    (NR == 1 || previous == "") && line ~ /^# \/[^[:space:]]+$/ { file = substr(line, 3); section = ""; previous = line; next }
+    { previous = line }
+    line == "" || line ~ /^[#;]/ { next }
+    line ~ /^\[.*\]$/ { section = line; next }
+    section == "[Journal]" && index(line, "=") > 1 {
+      key = substr(line, 1, index(line, "=") - 1); sub(/[[:space:]]+$/, "", key)
+      value = substr(line, index(line, "=") + 1); sub(/^[[:space:]]+/, "", value)
+      if (!(key in got)) keys[++n] = key
+      got[key] = value; from[key] = file
+    }
+    END { for (i = 1; i <= n; i++) printf "%s=%s\t%s\n", keys[i], got[keys[i]], from[keys[i]] }'
+}
+
+# journald_value VALUES KEY prints the value of KEY in VALUES, journald_conf_values's lines, or
+# nothing when they do not set it.
+journald_value() {
+  awk -F '\t' -v key="$2" 'index($1, key "=") == 1 { print substr($1, length(key) + 2); exit }' <<<"$1"
+}
+
+# journald_size VALUE prints VALUE, a size as journald.conf gives it, in bytes: a whole number, with
+# K, M, G, T, P or E for each power of 1024. It fails on any other form, such as a fraction.
+journald_size() {
+  local pl_units=KMGTPE pl_power=0
+  [[ $1 =~ ^([0-9]+)([KMGTPE]?)$ ]] || return 1
+  if [[ -n ${BASH_REMATCH[2]} ]]; then
+    pl_power=${pl_units%%"${BASH_REMATCH[2]}"*}
+    pl_power=$((${#pl_power} + 1))
+  fi
+  printf '%s\n' "$((10#${BASH_REMATCH[1]} << (10 * pl_power)))"
+}
+
+# journald_expected VALUES MACHINE_ID CARD prints, a field a line, what the usage line of a journald
+# that runs the setting VALUES (journald_conf_values's lines) holds: JOURNAL_PATH, the journal on
+# the card, /var/log/journal/MACHINE_ID, for Storage=persistent, or for Storage=auto, journald's
+# default, when CARD is yes (/var/log/journal is a directory), else the runtime one in
+# /run/log/journal; then MAX_USE and DISK_KEEP_FREE from SystemMaxUse and SystemKeepFree for the
+# journal on the card, RuntimeMaxUse and RuntimeKeepFree for the runtime one, each only when the
+# setting gives it in a form journald_size reads. journald works out a limit that the setting leaves
+# out from the file system, and rounds MAX_USE up to a whole page, so a setting of a whole number of
+# 64 KiB compares as given. It prints nothing for Storage=none, which keeps no journal, and fails on
+# a Storage it does not know.
+journald_expected() {
+  local pl_prefix pl_path pl_value pl_bytes
+  case $(journald_value "$1" Storage) in
+    none) return 0 ;;
+    persistent) pl_prefix=System pl_path=/var/log/journal/$2 ;;
+    volatile) pl_prefix=Runtime pl_path=/run/log/journal/$2 ;;
+    auto | '')
+      pl_prefix=Runtime pl_path=/run/log/journal/$2
+      if [[ $3 == yes ]]; then
+        pl_prefix=System pl_path=/var/log/journal/$2
+      fi
+      ;;
+    *) return 1 ;;
+  esac
+  printf 'JOURNAL_PATH=%s\n' "$pl_path"
+  pl_value=$(journald_value "$1" "${pl_prefix}MaxUse")
+  if [[ -n $pl_value ]] && pl_bytes=$(journald_size "$pl_value"); then
+    printf 'MAX_USE=%s\n' "$pl_bytes"
+  fi
+  pl_value=$(journald_value "$1" "${pl_prefix}KeepFree")
+  if [[ -n $pl_value ]] && pl_bytes=$(journald_size "$pl_value"); then
+    printf 'DISK_KEEP_FREE=%s\n' "$pl_bytes"
+  fi
+}
+
+# journald_running USAGE prints the fields of journald's usage line USAGE, one entry that
+# `journalctl -o json` prints, as journald_expected prints them. It fails on an entry it cannot read.
+journald_running() {
+  jq -er 'select(type == "object") | "JOURNAL_PATH=\(.JOURNAL_PATH // "")", "MAX_USE=\(.MAX_USE // "")",
+    "DISK_KEEP_FREE=\(.DISK_KEEP_FREE // "")"' <<<"$1"
+}
+
+# journald_differences EXPECTED RUNNING prints, one a line, each field of EXPECTED
+# (journald_expected's lines) that RUNNING (journald_running's) does not hold as "<field> is
+# <running's>, not <expected's>", and nothing when they agree.
+journald_differences() {
+  local pl_line pl_field pl_have
+  while IFS= read -r pl_line; do
+    [[ -n $pl_line ]] || continue
+    pl_field=${pl_line%%=*}
+    pl_have=$(awk -v field="$pl_field=" 'index($0, field) == 1 { print substr($0, length(field) + 1); exit }' <<<"$2")
+    if [[ $pl_line != "$pl_field=$pl_have" ]]; then
+      printf '%s is %s, not %s\n' "$pl_field" "${pl_have:-none}" "${pl_line#*=}"
+    fi
+  done <<<"$1"
+}

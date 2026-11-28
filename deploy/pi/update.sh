@@ -43,9 +43,6 @@ readonly STATUS_URL="${GHOST_WISPR_STATUS_URL:-http://127.0.0.1:8080/api/status}
 readonly VERSION_URL="${GHOST_WISPR_VERSION_URL:-http://127.0.0.1:8080/api/version}"
 readonly BINARY="$DEPLOY_DIR/ghost-wispr"
 readonly VERIFIED="$DEPLOY_DIR/deploy.verified"
-# The SHA-256 of the journald setting that journald last restarted and flushed on (reload_system,
-# journald_applied).
-readonly JOURNALD_APPLIED="$DEPLOY_DIR/journald-ghost-wispr.conf.applied"
 # The record of the update.sh before the deploy set, which installed the binary alone. The first
 # install of a set removes it.
 readonly OLD_VERIFIED="$DEPLOY_DIR/ghost-wispr.verified"
@@ -564,8 +561,7 @@ sudo_install() {
 # its bound: udevadm control --reload, then udevadm trigger; systemctl restart systemd-journald, then
 # journalctl --flush, which moves the boot's journal from /run to /var/log/journal once journald runs
 # with persistent storage. A journald restart keeps the services' log streams open (systemd keeps
-# them in journald's file descriptor store). Once both journald calls succeed, it writes the
-# installed setting's SHA-256 to JOURNALD_APPLIED (journald_applied).
+# them in journald's file descriptor store).
 reload_system() {
   local name
   for name in "$@"; do
@@ -580,27 +576,79 @@ reload_system() {
       journald-ghost-wispr.conf)
         timeout 30s sudo -n systemctl restart systemd-journald || return 1
         timeout 30s sudo -n journalctl --flush || return 1
-        sum "$(installed_path "$name")" >"$JOURNALD_APPLIED.tmp" && mv -f -- "$JOURNALD_APPLIED.tmp" "$JOURNALD_APPLIED" \
-          || return 1
         ;;
     esac
   done
 }
 
-# journald_applied PATH: journald last restarted, and flushed, on the journald setting PATH holds
-# now. A setting installed with no restart that succeeded after it, such as a first install whose
-# restart failed, which a rollback leaves installed as it has no .prev copy, or a run cut short
-# between the install and the restart, is not applied (GPT-6.1 Sol's review of #209).
-journald_applied() {
-  [[ -f $JOURNALD_APPLIED && -f $1 && $(<"$JOURNALD_APPLIED") == "$(sum "$1")" ]]
+# journald_runs_setting: the running journald runs its setting, as journald itself reports it (GPT-6.1
+# Sol's review of #209, round 2). The newest usage line of this boot from journald's MainPID
+# (pi-lib.sh's PI_LIB_JOURNALD_USAGE_ID) must hold each field that journald_expected reads from its
+# setting, `systemd-analyze cat-config systemd/journald.conf` under SYSTEM_ROOT: the journal it
+# writes, and its SystemMaxUse and SystemKeepFree. A journald that has logged none since its start,
+# as one restarted with no flush after, does not count. No record of this script's stands in for it,
+# and no clock. The line shows no SplitMode, SystemMaxFileSize or SyncIntervalSec: reload_system
+# restarts journald for any change of its setting's file. It sets journald_problem to why not.
+journald_runs_setting() {
+  local values id expected pid usage running differences card=no
+  journald_problem=''
+  if ! values=$(systemd-analyze --root="$SYSTEM_ROOT" cat-config systemd/journald.conf 2>/dev/null | journald_conf_values ''); then
+    journald_problem="could not read journald's setting (systemd-analyze cat-config systemd/journald.conf)"
+    return 1
+  fi
+  if ! id=$(cat -- "${SYSTEM_ROOT%/}/etc/machine-id" 2>/dev/null) || [[ ! $id =~ ^[0-9a-f]{32}$ ]]; then
+    journald_problem="could not read the machine id in ${SYSTEM_ROOT%/}/etc/machine-id"
+    return 1
+  fi
+  [[ ! -d ${SYSTEM_ROOT%/}/var/log/journal ]] || card=yes
+  if ! expected=$(journald_expected "$values" "$id" "$card"); then
+    journald_problem="journald's setting gives Storage=$(journald_value "$values" Storage), which this script does not know"
+    return 1
+  fi
+  [[ -n $expected ]] || return 0
+  pid=$(systemctl show systemd-journald -p MainPID --value 2>/dev/null) || pid=''
+  if [[ ! $pid =~ ^[1-9][0-9]*$ ]]; then
+    journald_problem="journald is not running (MainPID ${pid:-unknown})"
+    return 1
+  fi
+  if ! usage=$(timeout 30s sudo -n journalctl -b -q -o json -n 1 "_PID=$pid" _TRANSPORT=driver \
+    "MESSAGE_ID=$PI_LIB_JOURNALD_USAGE_ID" 2>/dev/null); then
+    journald_problem="could not read journald's usage line (sudo -n journalctl MESSAGE_ID=$PI_LIB_JOURNALD_USAGE_ID)"
+    return 1
+  fi
+  if [[ -z $usage ]] || ! running=$(journald_running "$usage"); then
+    journald_problem="journald (PID $pid) has logged no usage line since it started"
+    return 1
+  fi
+  differences=$(journald_differences "$expected" "$running")
+  if [[ -n $differences ]]; then
+    journald_problem="journald (PID $pid) reports $(paste -sd ';' - <<<"$differences" | sed 's/;/; /g')"
+    return 1
+  fi
+}
+
+# activate_journald makes the running journald run its setting. When journald_runs_setting finds it
+# does not, it says why, restarts journald and flushes the journal, after which the new journald
+# logs its usage line, and asks again; it changes nothing when journald runs its setting. It fails,
+# with journald_problem set, when journald does not run it after the restart.
+activate_journald() {
+  journald_runs_setting && return 0
+  printf 'ghost-wispr update: %s; restarting journald\n' "$journald_problem"
+  if ! timeout 30s sudo -n systemctl restart systemd-journald; then
+    journald_problem='could not restart journald'
+    return 1
+  fi
+  if ! timeout 30s sudo -n journalctl --flush; then
+    journald_problem="could not flush the journal after journald's restart"
+    return 1
+  fi
+  journald_runs_setting
 }
 
 # swap_in NAME... puts each staged file NAME ($stage/new/NAME) in place, and notes it in swapped,
 # and each system file that changed in changed_system. A system file equal to the installed one is
-# left as it is; the journald setting goes to changed_system all the same when journald does not run
-# it yet (journald_applied), so that journald restarts on it. device.crt goes in with its version
-# file, device.crt.version, as one change (install_certificate_pair). It returns non-zero at the
-# first file it could not install.
+# left as it is. device.crt goes in with its version file, device.crt.version, as one change
+# (install_certificate_pair). It returns non-zero at the first file it could not install.
 swap_in() {
   local name path
   for name in "$@"; do
@@ -612,9 +660,6 @@ swap_in() {
       install_certificate_pair "$stage/new/device.crt" "$certificate_version" || return 1
     elif is_system_file "$name"; then
       if [[ -f $path ]] && cmp -s -- "$stage/new/$name" "$path"; then
-        if [[ $name == journald-ghost-wispr.conf ]] && ! journald_applied "$path"; then
-          changed_system+=("$name")
-        fi
         continue
       fi
       swapped+=("$name")
@@ -691,6 +736,7 @@ restore_previous() {
   fi
   systemctl --user daemon-reload || restore_problems+='; could not reload the user manager'
   reload_system "${system[@]}" || restore_problems+='; could not reload udev, or restart logind or journald'
+  activate_journald || restore_problems+="; journald does not run its setting: $journald_problem"
   if ((${#missing[@]})); then
     restore_problems+="; no previous release to restore for ${missing[*]}, which stay as installed"
   fi
@@ -995,6 +1041,7 @@ install_release() {
   swap_in "${install_names[@]}" || rollback "could not install the release's files"
   systemctl --user daemon-reload || rollback "could not reload the user manager"
   reload_system "${changed_system[@]}" || rollback "could not reload udev, or restart logind or journald"
+  activate_journald || rollback "journald does not run its setting: $journald_problem"
   # A session or a call that started during the swap or the reloads stops the run here, with the
   # previous release's files back.
   leave_if_busy_before_restart
@@ -1036,6 +1083,7 @@ hold_if_bridge_rejects() {
       fail "could not empty the staging directory $stage for the refresh of the release the Pi runs"
     fi
     secrets_file='' secrets_failure='' certificate_staged='' certificate_version='' certificate_end=''
+    activate_journald || fail "journald does not run its setting: $journald_problem"
     require_no_override
     refresh_current
   fi
@@ -1066,6 +1114,7 @@ nightly() {
   if release_is_current; then
     printf 'ghost-wispr update: already current at commit %s\n' "$release_commit"
     report_drift
+    activate_journald || fail "journald does not run its setting: $journald_problem"
     # A refresh installs files and restarts the recorder too: the refusal holds for it (R7).
     require_no_override
     refresh_current

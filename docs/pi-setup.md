@@ -1124,7 +1124,7 @@ the check's input. It exits 1 when one check is not `PASS`.
    `PI_PROTECTED_RECORDINGS` in `pi.env` lists for them.
 7. The three provisioning files on the Pi and Serve's setting match the release.
 8. journald runs the release's `journald-ghost-wispr.conf` ("The Pi's journal"): the running
-   journald writes the journal on the card, and started after its setting last changed.
+   journald writes the journal on the card, and its own usage line reports the setting's limits.
 
 To run an update by hand, start its unit, so the launcher's time limit applies and a start of the
 timer joins it. The command returns when the run ends. Check 5 then fails for that install, which
@@ -1217,13 +1217,25 @@ value wins, so `90-` overrides the vendor's `40-`. It sets `Storage=persistent`;
 so `ghost-wispr`'s units log to the one system journal, as before; a cap of `SystemMaxUse=1G`,
 about seven months at the rate of 2026-11; `SystemKeepFree=5G` for the recordings; files of
 `SystemMaxFileSize=64M`; and journald's default `SyncIntervalSec=5m`: a longer interval writes the
-card less, but loses more of the lines before a power cut. The update records the setting that
-journald last restarted and flushed on, in `/opt/ghost-wispr/journald-ghost-wispr.conf.applied`, and
-restarts journald again in each later install until a restart and its flush succeed, as after a
-first install whose restart failed. check 8 of `check-deploy.sh` fails when another drop-in
-overrides one of these values, when the running journald has no journal on the card open, or has
-one in `/run`, or when it started before a file of its setting last changed. Boots before the first
-install of this setting are gone.
+card less, but loses more of the lines before a power cut.
+
+journald itself reports what it runs. At each flush and rotation it logs, from its own PID, a usage
+line, "System Journal (/var/log/journal/<machine-id>) is …, max …, … free." (`MESSAGE_ID`
+`ec387f577b844b8fa948f33cad9a75e6`), whose fields name the journal it writes and the `SystemMaxUse`
+and `SystemKeepFree` it read at its start; it reads its setting at no other time. After each install
+or rollback, and on the current release too, the update reads the newest such line of this boot
+from journald's PID. When journald has logged none, or the line differs from its setting as
+`systemd-analyze cat-config` gives it, the update restarts journald and flushes the journal, and
+reads the line again; an install whose journald still differs rolls back. check 8 of
+`check-deploy.sh` fails when another drop-in overrides one of the release's values, when the
+running journald has no journal on the card open or has one in `/run`, or when its usage line
+differs from its setting. Neither reads a clock or a file's change time: the Pi has no real-time
+clock, and network time steps its clock. The line shows no `SplitMode`, `SystemMaxFileSize` or
+`SyncIntervalSec`; the update restarts journald for any change of its setting's file. Boots before
+the first install of this setting are gone.
+
+When check 8 says journald has logged no usage line, run `sudo -n journalctl --flush` on the Pi,
+which makes journald log one, and check again.
 
 List the boots the journal holds, then read the recorder's lines of the boot before this one, and
 that boot's kernel lines (USB devices such as the Jabra):
