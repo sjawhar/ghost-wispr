@@ -1275,6 +1275,31 @@ sleep 0.5
 [[ -z $(left_by "$work_dir/kept") ]] || fail "control: processes of the planted run are left after their stop: $(left_by "$work_dir/kept")"
 planted_run "$work_dir/stopped"
 [[ -z $left ]] || fail "a case that failed midway left processes of the test 3 s after its exit: $(ps -o pid=,args= -p "$(paste -sd, <<<"$left")")"
+# A session ID that the system gave to another session (GPT-6.1 Sol's review of #208, round 3): a
+# process in a noted session whose TEST_LOG differs from this test's only where a "." is, as a
+# pattern would match it, is not this test's, and stop_fake_units leaves it. The control: a process
+# of this test in a noted session stops. Break it catches: a TEST_LOG compared as a pattern.
+near_log=${TEST_LOG//./X}
+[[ $near_log != "$TEST_LOG" ]] || fail "control: this test's TEST_LOG has no . to change: $TEST_LOG"
+setsid env TEST_LOG="$near_log" "$real_sleep" 600 &
+foreign=$!
+setsid "$real_sleep" 600 &
+owned=$!
+for _ in {1..50}; do
+  [[ $(ps -o sid= -p "$foreign" | tr -d ' ') != "$foreign" || $(ps -o sid= -p "$owned" | tr -d ' ') != "$owned" ]] || break
+  sleep 0.1
+done
+[[ $(ps -o sid= -p "$foreign" | tr -d ' ') == "$foreign" && $(ps -o sid= -p "$owned" | tr -d ' ') == "$owned" ]] \
+  || fail "control: the foreign and the owned sleep do not each lead a session"
+grep -qzxF -- "TEST_LOG=$near_log" "/proc/$foreign/environ" || fail "control: the foreign sleep does not hold the near TEST_LOG"
+printf 'foreign %s\nowned %s\n' "$foreign" "$owned" >>"$TEST_UNIT_SESSIONS"
+stop_fake_units
+foreign_state=$(ps -o stat= -p "$foreign" 2>/dev/null || true) owned_state=$(ps -o stat= -p "$owned" 2>/dev/null || true)
+kill "$foreign" "$owned" 2>/dev/null || true
+wait "$foreign" "$owned" 2>/dev/null || true
+[[ -z $owned_state || $owned_state == Z* ]] || fail "control: stop_fake_units left this test's process in a noted session (state $owned_state)"
+[[ -n $foreign_state && $foreign_state != Z* ]] \
+  || fail "stop_fake_units stopped a process whose TEST_LOG, $near_log, is not this test's, $TEST_LOG"
 
 # ---------------------------------------------------------------------------------------------------
 # bundle-refused: provision.sh reads no bundle. Input on standard input, such as the credential
@@ -2211,6 +2236,36 @@ update_journaled "ghost-wispr update: already current at commit $commit_a" \
   || fail "control: the update did not find the recorder free: $(<"$work_dir/journal")"
 cmp -s -- "$renamed" "$TEST_SERVE_STATE" || fail "provision.sh changed Serve while the recorder became busy: $(<"$TEST_SERVE_STATE")"
 no_serve_change 'a recorder that became busy after the update'
+# A Serve whose handlers hold text someone set (GPT-6.1 Sol's review of #208, round 3): a Text
+# body, a redirect and a proxy target, each with a canary. The run names each port, path and kind
+# of handler and the command that shows the whole setting, and prints none of the three, on the
+# busy recorder's refusal (exit 75, Sol's reproduction) as on the reset and apply. The control:
+# Tailscale's answer, which the run reads, holds them. Break it catches: a run that prints Serve's
+# lines as serve_lines_from_status reads them, values and all.
+text_serve='{"TCP":{"443":{"HTTPS":true},"8443":{"HTTPS":true}},"Web":{"ghost-wispr.example-tailnet.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:9/dummy-serve-proxy-canary"},"/note":{"Text":"dummy-serve-text-canary"}}},"ghost-wispr.example-tailnet.ts.net:8443":{"Handlers":{"/":{"Redirect":"https://example.test/dummy-serve-redirect-canary"}}}}}'
+for recorder in busy free; do
+  new_pi
+  printf '%s\n' "$text_serve" >"$TEST_SERVE_STATE"
+  answer=$(PATH="$bin:$PATH" tailscale serve status --json)
+  [[ $(grep -o 'dummy-serve-[a-z]*-canary' <<<"$answer" | LC_ALL=C sort | paste -sd ' ') == 'dummy-serve-proxy-canary dummy-serve-redirect-canary dummy-serve-text-canary' ]] \
+    || fail "control: Tailscale's answer does not hold the three canaries: $answer"
+  : >"$TEST_LOG"
+  if [[ $recorder == busy ]]; then
+    : >"$state/active"
+    printf '%s\n' '{"active_session_id":"meeting-789","paused":false,"capture_state":"recording"}' >"$state/status.json"
+    run_provision "$stage"
+    expect_busy 'a busy recorder and Serve handlers that hold text' 'active session'
+  else
+    TEST_SELF_STATUS=$joined_status run_provision "$stage"
+    expect_ran 'Serve handlers that hold text'
+    serve_is 'Serve handlers that hold text' "$want_serve"
+  fi
+  ! grep -q 'dummy-serve-[a-z]*-canary' "$work_dir/out" \
+    || fail "a run printed what a Serve handler holds ($recorder recorder): $(<"$work_dir/out")"
+  for words in '443 "/" proxy;443 "/note" text;8443 "/" redirect' 'read the whole setting with: sudo tailscale serve status'; do
+    said "$words" || fail "the run ($recorder recorder) did not say '$words': $(<"$work_dir/out")"
+  done
+done
 # A running recorder whose status cannot be read: an answer that is not its status, and a read that
 # does not end in time. Its state is unknown, so the apply refuses. Break it catches: an apply that
 # takes no status for a free recorder.
