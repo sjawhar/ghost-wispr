@@ -457,6 +457,14 @@ if [[ ${1:-} != -n ]]; then
 fi
 shift
 under=${TEST_TIMEOUT_DURATION:-none}
+# $TEST_STATE/sudo-slow, "SECONDS CALL", makes each call that starts with CALL take SECONDS real
+# seconds first, as a loaded Pi's call does: slow, but within its bound.
+if [[ -f $state/sudo-slow ]]; then
+  read -r slow_seconds slow_call <"$state/sudo-slow"
+  if [[ "$*" == "$slow_call"* ]]; then
+    /bin/sleep "$slow_seconds"
+  fi
+fi
 case ${1:-} in
   install)
     destination=${!#}
@@ -3533,6 +3541,19 @@ slow=1 restart_seconds=36000 release=broken run_update
 # The version wait's ten 2 s pauses between its 10 s reads, then the rollback's two status waits.
 rolled_back 'a 10-hour restart, then a release that never reports its commit' \
   "$(printf 'sleep 2\n%.0s' {1..10}; printf 'sleep 120\nsleep 120')"
+# A Pi under load: each journald restart and each udev reload takes 5 real seconds, well within its
+# 30 s bound, as the test's own commands did on a loaded dev box, where the old fake timeout's 3 s
+# cap cut such a call off and rolled the release back (rollback-whole-set, twice). The run installs
+# and verifies; a bound ends only a call that hangs. Break it catches: a fake timeout that ends a
+# call by the wall clock, not by the hang it stands for.
+new_pi
+install_set a
+printf '5 systemctl restart systemd-journald\n' >"$state/sudo-slow"
+release=b run_update
+expect_run 'a journald restart of 5 real seconds' 0 "ghost-wispr update: installed commit $commit_b (invocation test-invocation-7)"
+[[ $(grep -c 'timeout=30s systemctl restart systemd-journald journald=' "$state/sudo.log") == 1 ]] \
+  || fail "a journald restart of 5 real seconds: did not restart journald once, under its 30 s bound: $(<"$state/sudo.log")"
+[[ $(<"$state/clock") -lt 1100 ]] || fail "a journald restart of 5 real seconds: the test's clock moved $(($(<"$state/clock") - 1000)) s, as for a call that hung"
 
 for name in "${case_names[@]}"; do
   [[ $ran_cases == *" $name "* ]] || fail "the case $name of c-update never ran"
