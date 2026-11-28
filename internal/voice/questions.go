@@ -79,19 +79,24 @@ func (s *Supervisor) answeredLocked(ex *exchange, q *openQuestion, x *Exchange, 
 // (started) or ended at at, for the question log. Voices B and C name no
 // response in their audio, so the only proof that an answer played is a
 // speech the voice began after the answer came that ended by itself: such a
-// speech plays one answer, the oldest that came before it and none played
-// yet, and its end writes that answer's row. Audio that goes on in a speech
-// begun before an answer came, an acknowledgement's tail or the answer
-// itself, proves nothing, and the answer waits on: a stop then logs it as
-// stopped. A speech the speaker cut ends nothing here: the cut writes its
-// rows (cutDriverLocked, endLocked). s.mu is held.
+// speech plays one answer, the one that came first (by answeredAt, whatever
+// order the questions were asked in, as each result goes to the voice as its
+// call returns) of those that came before it and none played yet, and its
+// end writes that answer's row. Audio that goes on in a speech begun before
+// an answer came, an acknowledgement's tail or the answer itself, proves
+// nothing, and the answer waits on: a stop then logs it as stopped, another
+// end as unconfirmed (endLocked). A speech the speaker cut ends nothing
+// here: the cut writes its rows (cutDriverLocked, endLocked). s.mu is held.
 func (s *Supervisor) answerSpeechLocked(ex *exchange, started, cancelled bool, at time.Time) {
 	if started {
+		var first *openQuestion
 		for _, q := range ex.questions {
-			if q.answered && !q.playing && !at.Before(q.answeredAt) {
-				q.playing = true
-				return
+			if q.answered && !q.playing && !at.Before(q.answeredAt) && (first == nil || q.answeredAt.Before(first.answeredAt)) {
+				first = q
 			}
+		}
+		if first != nil {
+			first.playing = true
 		}
 		return
 	}

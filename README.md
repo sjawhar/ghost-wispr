@@ -741,8 +741,8 @@ What the voice hears, and where the room's words go:
   the turn as heard after the wake phrase, the wording of voice B's or voice C's vendor when it
   asked in other words, the voice, the issue taken, the answer Wispr was given to say, the outcome
   (`answered`, `asked_back`, `picked`, `side_talk`, `outage`, `asked_agent`, `stopped`,
-  `never_mind` or `failed`), when its words were said, and the time to its first audio and to its
-  end. A reply to Wispr's own question that asks nothing is kept as `side_talk`; other side talk,
+  `never_mind`, `failed` or `unconfirmed`), when its words were said, and the time to its first
+  audio and to its end. A reply to Wispr's own question that asks nothing is kept as `side_talk`; other side talk,
   and a wake with no question, are not kept. Words the room takes back are never kept: a turn
   keeps only what follows its last take-back, with no vendor wording, and a question "Wispr,
   never mind" cancels is kept as `never_mind` with its times and no words.
@@ -756,9 +756,12 @@ What the voice hears, and where the room's words go:
   When voice B or C asks for an answer after a stop or "Wispr, never mind", the unit refuses it and
   keeps nothing of it. Voices B and C name no answer in their audio, so the unit counts an answer
   of theirs played only when a speech that began after the answer came ends by itself, one answer
-  to a speech, oldest first. An answer spoken in the same speech as the voice's acknowledgement,
-  with no pause between, cannot be told from the acknowledgement, and is logged by how the
-  exchange ends: `stopped` on a stop, else `failed`, as nothing shows it was spoken.
+  to a speech, in the order the answers came. An answer spoken in the same speech as the voice's
+  acknowledgement, with no pause between, cannot be told from the acknowledgement, and is logged by
+  how the exchange ends: `stopped` on a stop, else `unconfirmed`, as nothing failed and nothing
+  shows it was spoken. `failed` is a failure of the Concierge's model or the voice, or a voice that
+  played no audio at all after it got the answer; only that last case plays the error sound for an
+  unspoken answer, never audio that may have been the answer.
   `ghost-wispr voice questions [--since DATE] [--json]` prints the log, read without writing to
   the database.
 - The `voice_tasks` ledger of questions sent to agents holds none of the room's words: it holds

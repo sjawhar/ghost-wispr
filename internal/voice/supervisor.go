@@ -539,9 +539,12 @@ type exchange struct {
 	// question it asked. The Supervisor keeps the newest exchange's after it
 	// ends, and they hold no words.
 	times *exchangeTimes
-	// unspokenAnswer: the answer tool returned words the driving voice has
-	// not begun to speak.
+	// unspokenAnswer: the answer tool returned words, at unspokenSince, and
+	// no audio of the driving voice has played since: no speech began after,
+	// and none went on past that time. Only then is the answer known to be
+	// unspoken, and the idle wait plays the error sound for it (idleWaited).
 	unspokenAnswer bool
+	unspokenSince  time.Time
 	// erred: the error sound played for it (exErrorLocked).
 	erred  bool
 	turnAt time.Time // when the turn was handed to the Concierge, or a held answer chosen to speak
@@ -2036,8 +2039,8 @@ func (s *Supervisor) idleWaited(ex *exchange, gen int) {
 	}
 	s.endLocked(ex, false, "idle")
 	if unspoken {
-		// The voice got an answer to speak and never began it: the room
-		// hears that it failed (R10), not silence.
+		// The voice got an answer to speak and played no audio after it:
+		// the room hears that it failed (R10), not silence.
 		s.logf("voice: the voice did not speak the answer it got")
 		s.errorLocked(ex.x.SessionID)
 	}
@@ -2080,8 +2083,14 @@ func (s *Supervisor) driverSpeechLocked(ex *exchange, started, cancelled bool, a
 		}
 		ex.newTurn = true
 	}
-	if started {
+	// Audio of the voice after the answer came, the start of a speech or the
+	// end of one that went on past it, is no evidence the answer went
+	// unspoken: it may have been the answer (INFRA-4592; Sol's review of
+	// #195 at 75c3253).
+	if started || !at.Before(ex.unspokenSince) {
 		ex.unspokenAnswer = false
+	}
+	if started {
 		return
 	}
 	s.voiceSpokeLocked(ex, cancelled)
@@ -2330,6 +2339,26 @@ func (t exchangeTools) followUpTurn(ctx context.Context) (side bool, turn string
 			return !isQuestion(turn), turn
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// awaitSpokenJudged waits until every ended speech of the voice is judged
+// (judgeSpokenLocked): until the session's events queued at each one's end
+// are read. Its error is ctx's, which a stop or the exchange's end cancels
+// (exchangeTools.Run), so an event that never comes holds nothing past them.
+func (t exchangeTools) awaitSpokenJudged(ctx context.Context) error {
+	s := t.s
+	for {
+		s.mu.Lock()
+		pending := len(t.ex.spoken) > 0
+		s.mu.Unlock()
+		if !pending {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -3096,9 +3125,8 @@ func (s *Supervisor) endLocked(ex *exchange, cut bool, reason string) {
 	// The question log's turn ends with ex: cut by a stop, a barge-in or the
 	// meeting's end, unless a never mind or a failure ended it (endedAs). An
 	// answer of a driving voice that no speech of its own played, at an end
-	// with no cut, as the follow-up window's or the idle wait's, is failed:
-	// nothing shows it was spoken (answerSpeechLocked), as the idle wait
-	// takes it for unspoken.
+	// with no cut, as the follow-up window's, is unconfirmed: nothing failed,
+	// and nothing shows it was spoken (answerSpeechLocked).
 	how := ex.endedAs
 	if how == "" && silence {
 		how = OutcomeStopped
@@ -3106,7 +3134,7 @@ func (s *Supervisor) endLocked(ex *exchange, cut bool, reason string) {
 	for _, q := range slices.Clone(ex.questions) {
 		cut := how
 		if cut == "" && ex.drives && q.answered && !q.playing {
-			cut = OutcomeFailed
+			cut = OutcomeUnconfirmed
 		}
 		s.settleQuestionLocked(ex, q, cut)
 	}
@@ -4290,6 +4318,13 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 	if err := json.Unmarshal(c.Args, &args); err != nil {
 		return nil, errors.New("answer tool: arguments are not an AnswerArgs object")
 	}
+	// Whether the turn is a follow-up or a reply to the voice's own question
+	// rests on the voice's speeches before it: those whose transcript was not
+	// read yet are judged first (judgeSpokenLocked). A stop or the
+	// exchange's end ends the wait.
+	if err := t.awaitSpokenJudged(ctx); err != nil {
+		return nil, err
+	}
 	side, turn := t.followUpTurn(ctx)
 	if side {
 		// Side talk in the follow-up window: no voice answers it, and the
@@ -4516,7 +4551,7 @@ func (t exchangeTools) Run(ctx context.Context, c ToolCall) (json.RawMessage, er
 	if len(lines) > 0 {
 		s.mu.Lock()
 		t.ex.askedBack, t.ex.voiceAsked = isQuestion(lines[len(lines)-1]), false
-		t.ex.unspokenAnswer = true // until the voice's speech starts
+		t.ex.unspokenAnswer, t.ex.unspokenSince = true, time.Now() // until the voice's audio plays after it
 		s.mu.Unlock()
 	}
 	return json.Marshal(AnswerResult{Say: strings.Join(lines, " "), IssueKey: x.IssueKey})

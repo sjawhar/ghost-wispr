@@ -68,15 +68,17 @@ func TestSolFollowup195AckTailIsNotAnswer(t *testing.T) {
 	}
 }
 
-// TestAnAnswerWithNoSpeechOfItsOwnEndsFailed fails if an answer a driving
-// voice got, followed by no speech of its own before the exchange ended with
-// no cut (here its follow-up window closes), is logged as anything but
-// failed, as the README says: nothing shows it was spoken. The control
-// speaks the answer in a speech of its own.
-func TestAnAnswerWithNoSpeechOfItsOwnEndsFailed(t *testing.T) {
+// TestAnAnswerWithNoSpeechOfItsOwnEndsUnconfirmed fails if an answer a
+// driving voice got, followed by no speech of its own before the exchange
+// ended with no cut (here its follow-up window closes), is logged as anything
+// but unconfirmed, as the README says: nothing failed, and nothing shows it
+// was spoken. It was logged failed at 75c3253, a model or voice failure it is
+// not (Sol's review there). The control speaks the answer in a speech of its
+// own.
+func TestAnAnswerWithNoSpeechOfItsOwnEndsUnconfirmed(t *testing.T) {
 	for _, ownSpeech := range []bool{false, true} {
 		name := "the answer continues the acknowledgement"
-		want := OutcomeFailed
+		want := OutcomeUnconfirmed
 		if ownSpeech {
 			name, want = "a speech of its own control", OutcomeAnswered
 		}

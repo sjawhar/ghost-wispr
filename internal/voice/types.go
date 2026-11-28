@@ -177,14 +177,20 @@ const (
 	// OutcomeNeverMind: "Wispr, never mind" cut the answer, or the person
 	// said no to the issues Wispr offered.
 	OutcomeNeverMind QuestionOutcome = "never_mind"
-	// OutcomeFailed: the Concierge's model or the voice failed.
+	// OutcomeFailed: the Concierge's model or the voice failed, or the voice
+	// played nothing after it got the answer.
 	OutcomeFailed QuestionOutcome = "failed"
+	// OutcomeUnconfirmed: nothing failed, and nothing confirms the answer
+	// played: voice B or C went on with a speech it began before the answer
+	// came, and began none after, so its audio cannot be told from the
+	// acknowledgement's tail (answerSpeechLocked).
+	OutcomeUnconfirmed QuestionOutcome = "unconfirmed"
 )
 
 // QuestionOutcomes are every QuestionOutcome.
 var QuestionOutcomes = []QuestionOutcome{
 	OutcomeAnswered, OutcomeAskedBack, OutcomePicked, OutcomeSideTalk, OutcomeOutage,
-	OutcomeAskedAgent, OutcomeStopped, OutcomeNeverMind, OutcomeFailed,
+	OutcomeAskedAgent, OutcomeStopped, OutcomeNeverMind, OutcomeFailed, OutcomeUnconfirmed,
 }
 
 // Question is one turn the Concierge handled, as the question log keeps it

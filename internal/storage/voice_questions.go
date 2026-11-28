@@ -37,14 +37,19 @@ const (
 	// VoiceQuestionNeverMind: "Wispr, never mind" cut the answer, or the
 	// person declined the issues Wispr offered ("no, neither").
 	VoiceQuestionNeverMind VoiceQuestionOutcome = "never_mind"
-	// VoiceQuestionFailed: the Concierge's model or the voice failed.
+	// VoiceQuestionFailed: the Concierge's model or the voice failed, or the
+	// voice played nothing after it got the answer.
 	VoiceQuestionFailed VoiceQuestionOutcome = "failed"
+	// VoiceQuestionUnconfirmed: nothing failed, and nothing confirms the
+	// answer played: voice B or C spoke it, if at all, in a speech it began
+	// before the answer came.
+	VoiceQuestionUnconfirmed VoiceQuestionOutcome = "unconfirmed"
 )
 
 // VoiceQuestionOutcomes are every outcome the question log keeps.
 var VoiceQuestionOutcomes = []VoiceQuestionOutcome{
 	VoiceQuestionAnswered, VoiceQuestionAskedBack, VoiceQuestionPicked, VoiceQuestionSideTalk, VoiceQuestionOutage,
-	VoiceQuestionAskedAgent, VoiceQuestionStopped, VoiceQuestionNeverMind, VoiceQuestionFailed,
+	VoiceQuestionAskedAgent, VoiceQuestionStopped, VoiceQuestionNeverMind, VoiceQuestionFailed, VoiceQuestionUnconfirmed,
 }
 
 // VoiceQuestion is one row of the voice_questions log: a turn the Concierge
